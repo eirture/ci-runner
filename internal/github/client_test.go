@@ -154,10 +154,11 @@ func TestListRunnerApplicationsRepository(t *testing.T) {
 	if gotPath != "/repos/o/r/actions/runners/downloads" {
 		t.Fatalf("unexpected path: %s", gotPath)
 	}
-	if len(applications) != 3 {
-		t.Fatalf("expected 3 Linux applications, got %#v", applications)
+	if len(applications) != 4 {
+		t.Fatalf("expected 3 Linux applications and 1 Windows application, got %#v", applications)
 	}
 	want := RunnerApplication{
+		OS:             "linux",
 		Architecture:   "x64",
 		Version:        "2.337.0",
 		DownloadURL:    "https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz",
@@ -165,6 +166,16 @@ func TestListRunnerApplicationsRepository(t *testing.T) {
 	}
 	if applications[0] != want {
 		t.Fatalf("unexpected x64 application: %#v", applications[0])
+	}
+	wantWindows := RunnerApplication{
+		OS:             "win",
+		Architecture:   "x64",
+		Version:        "2.337.0",
+		DownloadURL:    "https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-win-x64-2.337.0.zip",
+		SHA256Checksum: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	}
+	if applications[3] != wantWindows {
+		t.Fatalf("unexpected Windows x64 application: %#v", applications[3])
 	}
 }
 

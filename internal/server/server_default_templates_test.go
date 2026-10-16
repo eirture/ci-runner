@@ -374,6 +374,7 @@ func TestStartRunnerCustomRunnerApplicationsMapsValidatedDownload(t *testing.T) 
 	}
 	inputs := sandbox.startInputs()
 	want := sandboxrunner.RunnerApplication{
+		OS:             "linux",
 		Architecture:   "x64",
 		Version:        "2.337.0",
 		DownloadURL:    "https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz",
@@ -381,6 +382,9 @@ func TestStartRunnerCustomRunnerApplicationsMapsValidatedDownload(t *testing.T) 
 	}
 	if len(inputs) != 1 || len(inputs[0].RunnerApplications) != 1 || inputs[0].RunnerApplications[0] != want {
 		t.Fatalf("custom StartRunner applications = %#v, want %#v", inputs, want)
+	}
+	if inputs[0].Platform != sandboxrunner.PlatformLinux {
+		t.Fatalf("custom StartRunner platform = %q, want %q", inputs[0].Platform, sandboxrunner.PlatformLinux)
 	}
 }
 

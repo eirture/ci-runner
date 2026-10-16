@@ -518,7 +518,11 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 		}
 
 		// Generate cache STS credentials for this repository if cache is configured.
+		platform := sandboxrunner.PlatformForLabels(req.Labels)
+		// Windows runners do not provide Docker.
+		requireDocker := profile.TemplateSource == state.TemplateSourcePublic && platform != sandboxrunner.PlatformWindows
 		input := sandboxrunner.StartInput{
+			Platform:           platform,
 			RequestID:          req.ID,
 			RunnerName:         req.RunnerName,
 			RepositoryURL:      repositoryURL,
@@ -527,7 +531,7 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 			RunnerGroup:        strings.TrimSpace(req.RunnerGroup),
 			RunnerApplications: runnerApplications,
 			TemplateID:         templateID,
-			RequireDocker:      profile.TemplateSource == state.TemplateSourcePublic,
+			RequireDocker:      requireDocker,
 			Timeout:            s.cfg.SandboxTimeout,
 			CommandContext:     ctx,
 			OnStdout:           func(data []byte) { s.appendRunnerStdout(id, data) },
@@ -1162,6 +1166,7 @@ func (s *Server) recoverActiveRunner(ctx context.Context, st state.RunnerState, 
 	// That prevents an attached OnExit watcher from owning rejected state.
 	exitWatchAccepted := make(chan runnerAttemptIdentity, 1)
 	result, err := sandboxService.RecoverRunner(ctx, sandboxrunner.RecoverInput{
+		Platform:       sandboxrunner.PlatformForLabels(req.Labels),
 		RequestID:      st.ID,
 		SandboxID:      st.SandboxID,
 		PID:            st.ProcessPID,

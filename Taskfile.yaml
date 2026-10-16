@@ -291,6 +291,11 @@ tasks:
     cmds:
       - QSHELL="{{.QSHELL}}" scripts/run-runner-template-operation.sh unpublish "{{.PUBLIC_TEMPLATE_CONFIG}}"
 
+  template-build-windows-11:
+    desc: Build the Windows 11 template with kodoctl and wait until ready (optional KODOCTL_CONTEXT)
+    cmds:
+      - KODOCTL_CONTEXT="{{.KODOCTL_CONTEXT}}" scripts/build-windows-template.sh templates/github-runner-windows-11
+
   template-build-all:
     desc: Build all eight public templates sequentially with qshell and wait until ready
     cmds:
