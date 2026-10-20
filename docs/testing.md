@@ -731,6 +731,24 @@ Ubuntu 26.04 rootfs, and checks apt-owned `packaging` stays unchanged, pipx tool
 retain their directories, ordinary users can invoke pipx, and installer failures
 still stop the build. This does not replace regional Sandbox build/smoke gates.
 
+### Windows runner end-to-end test
+
+`TestWindowsRunnerE2E` in `internal/sandboxrunner` drives `StartRunner`,
+`RecoverRunner`, one real GitHub Actions job, and `StopRunner` against a real
+Windows Sandbox. It is skipped unless `RUNNERD_WINDOWS_E2E=1`, and needs
+`QINIU_SANDBOX_API_URL`, `QINIU_API_KEY`, `RUNNERD_E2E_TEMPLATE_ID`,
+`RUNNERD_E2E_REPOSITORY_URL`, and a fresh `RUNNERD_E2E_REGISTRATION_TOKEN`.
+Optionally set `RUNNERD_E2E_TEMPLATE_VERSION`, `RUNNERD_E2E_LABELS`, and a
+`RUNNERD_E2E_TRIGGER_CMD` bash command that queues one matching job after the
+Runner starts listening; otherwise trigger the job manually.
+
+```bash
+RUNNERD_WINDOWS_E2E=1 go test -tags development ./internal/sandboxrunner -run TestWindowsRunnerE2E -v -timeout 25m
+```
+
+It does not exercise webhooks, Runner Specs, or the web UI; use `task dev` with
+a fixed-ID spec whose labels include `windows` for that path.
+
 ## 11. Official References
 
 - GitHub self-hosted runner workflow labels: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-self-hosted-runners-in-a-workflow

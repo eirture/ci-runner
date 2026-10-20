@@ -714,6 +714,23 @@ Docker 和网络，在固定的 Ubuntu 26.04 根文件系统中执行固定的�
 apt 管理的 `packaging` 保持不变、pipx 工具目录兼容、普通用户可执行 pipx，
 以及安装失败仍会阻止构建。该检查不能替代区域 Sandbox 构建与 smoke 门禁。
 
+### Windows Runner 端到端测试
+
+`internal/sandboxrunner` 中的 `TestWindowsRunnerE2E` 会在真实 Windows Sandbox 上依次执行
+`StartRunner`、`RecoverRunner`、一个真实 GitHub Actions job 和 `StopRunner`。只有设置
+`RUNNERD_WINDOWS_E2E=1` 时才会运行，需要 `QINIU_SANDBOX_API_URL`、`QINIU_API_KEY`、
+`RUNNERD_E2E_TEMPLATE_ID`、`RUNNERD_E2E_REPOSITORY_URL` 和新生成的
+`RUNNERD_E2E_REGISTRATION_TOKEN`。可选设置 `RUNNERD_E2E_TEMPLATE_VERSION`、
+`RUNNERD_E2E_LABELS`，以及一条 bash 命令 `RUNNERD_E2E_TRIGGER_CMD`：Runner 开始监听后由它触发一个匹配的
+job；不设置时请手动触发。
+
+```bash
+RUNNERD_WINDOWS_E2E=1 go test -tags development ./internal/sandboxrunner -run TestWindowsRunnerE2E -v -timeout 25m
+```
+
+它不覆盖 webhook、Runner Spec 和 Web UI；这条链路请用 `task dev`，并配置一个 labels 包含
+`windows` 的固定 ID spec 验证。
+
 ## 11. 官方参考
 
 - GitHub self-hosted runner workflow labels: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-self-hosted-runners-in-a-workflow
