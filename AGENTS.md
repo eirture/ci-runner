@@ -90,11 +90,13 @@ Use `task smee` for standalone GitHub webhook forwarding. It reads `.smee-url` a
 Use `task build` when verifying production embedded UI behavior because it rebuilds `internal/server/ui/` before compiling `bin/runnerd`.
 
 Public runner templates are built with `qiniu/qshell` 2.19.13 or newer.
-The preview `github-runner-windows-11` template is the exception: Windows
-Sandbox templates are built only from a provider disk image with
-`kodoctl sbx tpl build --os-platform windows`, using `--copy` for the pinned
-setup script (`task template-build-windows-11 KODOCTL_CONTEXT=<context>`). Its
-`template.env` must never contain a template ID, and its Windows Runner pin must
+The preview `github-runner-windows-11` template also uses qshell, but its
+`qshell.sandbox.toml` sets `from_template = "windows11"` because Windows
+Sandbox templates cannot start from a Docker image; qshell ignores the
+Dockerfile `FROM`. The Windows builder ignores `USER` and runs `RUN` steps
+through `cmd.exe`; the Dockerfile uses the `` ` `` escape directive and COPYs the pinned setup script and `template.env`
+(`task template-build-windows-11`). Neither file may contain a template ID,
+`TEMPLATE_NAME` must equal the toml `name`, and its Windows Runner pin must
 equal the common `RUNNER_VERSION`. runnerd selects the Windows launch path when
 the Runner labels include `windows`: Windows envd runs commands through
 `cmd.exe` and rejects `root`, so the start script runs as the envd default

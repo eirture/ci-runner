@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -159,18 +160,23 @@ func TestWindowsRuntimeEnvironmentCommandAvoidsCmdMetacharacters(t *testing.T) {
 	}
 }
 
-func TestWindowsTemplateBuildCopiesReviewedInputs(t *testing.T) {
+func TestWindowsTemplateBuildUsesQshellOnWindows11Template(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	argsFile := filepath.Join(root, "args")
-	stagedFile := filepath.Join(root, "staged")
-	fakeKodoctl := filepath.Join(root, "kodoctl")
-	writeExecutable(t, fakeKodoctl, `#!/usr/bin/env bash
-printf '%s\n' "$@" >"`+argsFile+`"
-find qiniu-build -type f | sort >"`+stagedFile+`"
-cat qiniu-build/build.env >>"`+stagedFile+`"
+	configFile := filepath.Join(root, "config")
+	fakeQshell := filepath.Join(root, "qshell")
+	writeExecutable(t, fakeQshell, `#!/usr/bin/env bash
+if [ "$1" = version ]; then
+  echo v2.19.13
+  exit 0
+fi
+{ pwd; printf '%s\n' "$@"; } >"`+argsFile+`"
+cat "${@: -1}" >"`+configFile+`"
+echo 'Status: ready'
 `)
-	output, err := runCommand(t, "bash", []string{"scripts/build-windows-template.sh", "templates/github-runner-windows-11"}, "KODOCTL="+fakeKodoctl, "KODOCTL_CONTEXT=test/ctx")
+	output, err := runCommand(t, "bash", []string{"scripts/build-windows-template.sh", "templates/github-runner-windows-11"},
+		"QSHELL="+fakeQshell, "QINIU_SANDBOX_API_URL=https://sandbox.invalid", "QINIU_API_KEY=test")
 	if err != nil {
 		t.Fatalf("build helper: %v: %s", err, output)
 	}
@@ -178,25 +184,46 @@ cat qiniu-build/build.env >>"`+stagedFile+`"
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{
-		"-c\ntest/ctx\nsbx\ntpl\nbuild\n",
-		"--name\ngithub-runner-windows-11\n",
-		"--os-platform\nwindows\n",
-		"--from-disk-image\nfile:///home/qboxserver/qiniu/cloud-hypervisor/windows-11-25h2.compressed.qcow2\n",
-		"--copy\nqiniu-build:C:\\qiniu-build\n",
-		"-File C:\\qiniu-build\\setup-template.ps1 -BuildEnvironmentFile C:\\qiniu-build\\build.env\n",
-		"--run-cmd\nrmdir /s /q C:\\qiniu-build\n",
-	} {
-		if !strings.Contains(string(args), want) {
-			t.Fatalf("kodoctl args do not contain %q:\n%s", want, args)
-		}
+	if want := filepath.Join(repositoryRoot(t), "templates", "github-runner-windows-11") + "\nsandbox\ntemplate\nbuild\n--wait\n--config\n"; !strings.HasPrefix(string(args), want) {
+		t.Fatalf("qshell invocation = %s, want prefix %q", args, want)
 	}
-	staged, err := os.ReadFile(stagedFile)
+	config, err := os.ReadFile(configFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(staged), "qiniu-build/build.env\nqiniu-build/setup-template.ps1\nTEMPLATE_NAME=") || strings.Contains(string(staged), "#") {
-		t.Fatalf("staged build inputs = %s", staged)
+	for _, want := range []string{
+		`name = "github-runner-windows-11"`,
+		`from_template = "windows11"`,
+		`dockerfile = "./Dockerfile"`,
+		`path = ".."`,
+	} {
+		if !strings.Contains(string(config), want+"\n") {
+			t.Fatalf("qshell config does not contain %q:\n%s", want, config)
+		}
+	}
+	if regexp.MustCompile(`(?m)^\s*template_id\s*=`).Match(config) {
+		t.Fatalf("qshell config contains a template ID:\n%s", config)
+	}
+
+	dockerfile, err := os.ReadFile(filepath.Join(repositoryRoot(t), "templates", "github-runner-windows-11", "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"# escape=`\n",
+		"\nUSER user\n",
+		"\nCOPY github-runner-windows-11/scripts/setup-template.ps1 C:\\qiniu-build\\setup-template.ps1\n",
+		"\nCOPY github-runner-windows-11/template.env C:\\qiniu-build\\build.env\n",
+		"-File C:\\qiniu-build\\setup-template.ps1 -BuildEnvironmentFile C:\\qiniu-build\\build.env\n",
+		"\nRUN rmdir /s /q C:\\qiniu-build\n",
+	} {
+		if !strings.Contains(string(dockerfile), want) {
+			t.Fatalf("Windows Dockerfile does not contain %q:\n%s", want, dockerfile)
+		}
+	}
+	// Windows envd rejects root, and the Linux Runner archive chunks are unused.
+	if strings.Contains(string(dockerfile), "USER root") || strings.Contains(string(dockerfile), "common/.build") {
+		t.Fatalf("Windows Dockerfile uses Linux-only build steps:\n%s", dockerfile)
 	}
 }
 

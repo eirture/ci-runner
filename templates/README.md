@@ -22,8 +22,9 @@ The image-specific reports are [Ubuntu Slim](github-runner-ubuntu-slim/software-
 `ubuntu-latest` is a logical mapping to the 24.04 physical template and has no
 fifth source directory.
 
-The Windows 11 template is built with kodoctl from a provider disk image rather
-than a qshell Dockerfile; see its [README](github-runner-windows-11/README.md).
+The Windows 11 template is built with qshell on top of the provider's
+`windows11` template rather than a Docker base image; see its
+[README](github-runner-windows-11/README.md).
 It is not part of the Ubuntu compatibility manifest, publication, or catalog
 gates below.
 

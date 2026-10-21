@@ -16,7 +16,7 @@ import (
 // Required environment:
 //   - QINIU_SANDBOX_API_URL and QINIU_API_KEY: Sandbox service credentials.
 //   - RUNNERD_E2E_TEMPLATE_ID: a github-runner-windows-11 template ID.
-//   - RUNNERD_E2E_REPOSITORY_URL: for example https://github.com/eirture/kodoctl.
+//   - RUNNERD_E2E_REPOSITORY_URL: for example https://github.com/OWNER/REPO.
 //   - RUNNERD_E2E_REGISTRATION_TOKEN: a fresh runner registration token.
 //
 // Optional environment:

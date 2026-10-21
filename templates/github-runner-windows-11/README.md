@@ -1,15 +1,20 @@
 # GitHub runner Windows 11 template
 
-This 4-vCPU, 8192-MiB Windows 11 x64 template is built from the provider's
-Windows 11 25H2 disk image. Windows Sandbox templates cannot be built from a
-Dockerfile or an existing template, and qshell has no disk-image or OS-platform
-options, so the build uses `kodoctl sbx tpl build --from-disk-image
---os-platform windows`.
+This 4-vCPU, 8192-MiB Windows 11 x64 template is built with qshell on top of
+the provider's `windows11` template. Windows Sandbox templates cannot start from
+a Docker image, so `qshell.sandbox.toml` sets `from_template = "windows11"` and
+qshell ignores the Dockerfile `FROM` line. The template keeps the base
+template's 50 GiB disk, about 11 GiB of which is free after setup;
+`disk_size_mb = 51200` records that size for the shared build and publish
+checks.
 
-The build copies `scripts/setup-template.ps1` and the `KEY=VALUE` lines of
-`template.env` into `C:\qiniu-build`. It runs the script with Windows
-PowerShell 5.1, then removes the directory. Every download is pinned by URL,
-size, and SHA-256. The script installs:
+The Dockerfile uses the `` ` `` escape directive so Windows paths keep their
+backslashes. The Windows builder runs `RUN` steps through `cmd.exe` as the
+console user and ignores `USER`, including the `USER root` step qshell always
+prepends. It copies
+`scripts/setup-template.ps1` and `template.env` into `C:\qiniu-build`, runs the
+script with Windows PowerShell 5.1, then removes the directory. Every download
+is pinned by URL, size, and SHA-256. The script installs:
 
 - the GitHub Actions Runner win-x64 archive in `C:\actions-runner`;
 - Git for Windows, with `Git\cmd` and `Git\bin` on the machine `PATH`, so
@@ -32,11 +37,14 @@ install them in the workflow or build a custom template.
 ## Build
 
 ```bash
-task template-build-windows-11 KODOCTL_CONTEXT=<kodoctl-context>
+QINIU_SANDBOX_API_URL=<sandbox-api-url> QINIU_API_KEY=<api-key> \
+  task template-build-windows-11
 ```
 
-`template.env` holds the provider inputs and must never contain an
-environment-specific template ID. `RUNNER_WIN_X64_VERSION` must equal
+`scripts/build-windows-template.sh` checks the Windows pins, then runs the
+shared qshell build helper with `qshell.sandbox.toml`. Neither `template.env`
+nor `qshell.sandbox.toml` may contain an environment-specific template ID, and
+`TEMPLATE_NAME` must equal the toml `name`. `RUNNER_WIN_X64_VERSION` must equal
 `RUNNER_VERSION` in `templates/common/actions-runner.env`; the build helper
 fails closed when an Actions Runner update leaves the Windows archive pin
 behind. Bump `TEMPLATE_VERSION` when the template contents change.
