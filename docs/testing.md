@@ -764,8 +764,29 @@ outcomes and confirmed missing resources. Provider HTTP fixtures check metadata
 lookup without creation, missing Sandbox handling and reconnect lifetime.
 These checks do not prove public ingress, real Contents permission or remote
 resource release. Use [Deployment Smoke](deployment-smoke.md#9-sandbox-deploy-acceptance)
-for those gates. `deploy.allow_admin_fallback` defaults to false, independently
-of CI fallback configuration.
+for those gates. Deploy uses the shared scoped/inherited/platform Sandbox service
+eligibility rules without a separate opt-in. `TestDeploymentSandboxServiceMatchesJobEligibility`
+covers platform enablement, complete configuration, selected-audience identity/type,
+scoped and inherited priority, fail-closed corruption and legacy records without snapshots.
+`TestDeploymentPlatformServiceTemplateAccess` exercises owner/member public-only
+discovery, creation and redeploy without reading the platform private catalog;
+`TestRepositoryMemberCanDeployWithoutPrivateCatalogAccess` retains scoped private
+binding replay. `TestDeploymentRuntimePreservesSavedService` covers reconnection
+with saved credentials when no platform default is enabled and rejects corrupt snapshots.
+`TestLegacyDeploymentRejectsPlatformPrivateTemplate` rejects private/unbuilt choices
+before provider validation or creation when legacy queued records lack snapshots.
+`TestPersonalRepositoryCollaboratorDeploymentAudience` covers personal-repository
+collaborators across template discovery, creation, redeploy and legacy resolution:
+owner selected allows platform use, collaborator-only or wrong-type selection denies
+it without revision/audit changes, and collaborator-scoped credentials keep priority.
+Its platform outcomes are checked against Jobs.
+`TestPlatformDeploymentRetryDoesNotRequireOrganizationOwnership` verifies that
+forbidden/unavailable organization membership lookup cannot block a platform-backed
+public retry. Exact repository authorization, audience checks and private-template
+rejection still apply; rejected retries leave revision/audit state unchanged.
+The execution-only live worker probe
+selects operator credentials directly; repository-owner audience admission belongs
+to the live API gate. These local fixtures do not prove a real provider deployment.
 
 The worker tests also cover the startup-only exact Host environment for Vite,
 preservation of unrelated environment values, and rejection before startup when

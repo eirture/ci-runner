@@ -23,6 +23,117 @@ func deploymentAuthCall(s *Server, method, path, body string) *httptest.Response
 	return w
 }
 
+func TestPersonalRepositoryCollaboratorDeploymentAudience(t *testing.T) {
+	for _, tc := range []struct {
+		name, audienceType string
+		audienceID         int64
+		scoped             bool
+		allowed            bool
+	}{
+		{name: "owner selected", audienceID: 200, audienceType: "user", allowed: true},
+		{name: "only collaborator selected", audienceID: 100, audienceType: "user"},
+		{name: "owner wrong account type", audienceID: 200, audienceType: "organization"},
+		{name: "collaborator scoped credentials take priority", audienceID: 100, audienceType: "user", scoped: true, allowed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveActiveInstallationFixture(w, r, 987) {
+					return
+				}
+				switch r.URL.Path {
+				case "/user/installations/987/repositories":
+					fmt.Fprint(w, `{"repositories":[{"id":42,"full_name":"bob/project","owner":{"id":200,"login":"bob","type":"User"}}]}`)
+				case "/repos/bob/project/commits/refs/heads/main":
+					fmt.Fprintf(w, `{"sha":%q}`, strings.Repeat("a", 40))
+				case "/repos/bob/project/contents/.qiniu/deploy.yaml":
+					fmt.Fprintf(w, `{"type":"file","encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString([]byte("version: 1\ninstall_command: npm ci\nstart_command: npm start\nport: 3000\n")))
+				default:
+					t.Errorf("unexpected GitHub request: %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer api.Close()
+			store := state.New(t.TempDir())
+			srv := newTestServer(t, store, api.URL, nil)
+			srv.Close()
+			srv.sandbox = nil
+			srv.loopCtx = context.Background()
+			srv.sandboxHTTP = deploymentTemplateTestClient()
+			account, _, err := store.EnsureAccountForOAuthIdentity(state.OAuthIdentity{OAuthProvider: "github", OAuthSubject: "100", OAuthLogin: "alice"}, "user")
+			if err != nil {
+				t.Fatal(err)
+			}
+			saveTestGitHubOAuthToken(t, store, account.ID, srv.cfg.AuthEncryptionKey.Value(), "user-token")
+			installation, err := store.UpsertGitHubInstallation(state.GitHubInstallation{AccountID: account.ID, InstallationID: 987, GitHubAccountID: 200, AccountType: "user", AccountLogin: "bob"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			key, err := encryptSecret("fixture-platform-key", srv.cfg.AuthEncryptionKey.Value())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.UpsertSandboxServiceDefault(state.SandboxServiceDefault{Enabled: true, APIURL: "https://platform.example", APIKeyEncrypted: key, AudienceMode: state.SandboxServiceDefaultAudienceModeSelected}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.UpsertSandboxServiceDefaultAudience(state.SandboxServiceDefaultAudience{GitHubAccountID: tc.audienceID, AccountType: tc.audienceType, AccountLogin: "display-only"}); err != nil {
+				t.Fatal(err)
+			}
+			wantSource := sandboxConfigSourceAdminDefault
+			if tc.scoped {
+				wantSource = sandboxConfigSourceAccount
+				if _, err := store.UpsertAccountPreference(state.AccountPreference{ScopeType: state.AccountScopeTypeAccount, ScopeID: account.ID, Namespace: accountPreferenceNamespaceSandbox, Key: accountPreferenceKeySandboxService, ValueJSON: `{"api_url":"https://scoped.example"}`}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.UpsertAccountSecret(state.AccountSecret{ScopeType: state.AccountScopeTypeAccount, ScopeID: account.ID, KeyType: state.AccountSecretTypeSandboxAPIKey, EncryptedValue: key}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			call := func(method, path, body string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(method, path, strings.NewReader(body))
+				r.AddCookie(testSessionCookie("100", "alice", "user"))
+				w := httptest.NewRecorder()
+				srv.ServeHTTP(w, r)
+				return w
+			}
+			catalog := call("GET", fmt.Sprintf("/user/deployment-templates?installation_id=%d&repository_full_name=bob/project", installation.ID), "")
+			creation := call("POST", "/user/deployments", fmt.Sprintf(`{"installation_id":%d,"repository_full_name":"bob/project","source":"branch","ref":"main","template_id":"public-base"}`, installation.ID))
+			fixture := state.Deployment{ID: "collaborator-retry", AccountID: account.ID, ScopeType: state.AccountScopeTypeAccount, ScopeID: account.ID, GitHubInstallationID: 987, RepositoryID: 42, RepositoryFullName: "bob/project", Ref: "refs/heads/main", CommitSHA: strings.Repeat("a", 40), ConfigPath: ".qiniu/deploy.yaml", SnapshotVersion: 1, SpecHash: "hash", SpecJSONEncrypted: "encrypted", DeploymentTemplateID: "public-base", Status: state.DeploymentStatusCompleted, ExpiresAt: time.Now().Add(time.Hour)}
+			if _, err := store.CreateDeployment(fixture); err != nil {
+				t.Fatal(err)
+			}
+			retry := call("POST", "/user/deployments/"+fixture.ID+"/retry", `{}`)
+			factory := serverDeploymentRuntimeFactory{server: srv}
+			_, _, legacyErr := factory.service(context.Background(), fixture)
+			_, jobSnapshot, jobErr := srv.sandboxServiceAndConfigForRunnerRequestContext(context.Background(), state.RunnerRequest{ID: "collaborator-job", GitHubInstallationID: 987})
+			if tc.allowed {
+				if catalog.Code != 200 || creation.Code != 201 || retry.Code != 202 || legacyErr != nil || (!tc.scoped && jobErr != nil) {
+					t.Fatalf("owner eligibility/scoped priority: catalog=%d creation=%d retry=%d legacy=%v job=%v", catalog.Code, creation.Code, retry.Code, legacyErr, jobErr)
+				}
+				var created deploymentResponse
+				if err := json.Unmarshal(creation.Body.Bytes(), &created); err != nil {
+					t.Fatal(err)
+				}
+				saved, err := store.GetDeployment(created.ID)
+				if err != nil || saved.ScopeID != account.ID || saved.GitHubInstallationID != 987 || saved.SandboxConfigSource != wantSource || (!tc.scoped && jobSnapshot.Source != wantSource) {
+					t.Fatal("credential scope, repository installation or service source changed")
+				}
+			} else {
+				if catalog.Code != 409 || creation.Code != 409 || retry.Code != 409 || legacyErr == nil || jobErr == nil {
+					t.Fatalf("unselected owner must be denied: catalog=%d creation=%d retry=%d legacy=%v job=%v", catalog.Code, creation.Code, retry.Code, legacyErr, jobErr)
+				}
+				saved, err := store.GetDeployment(fixture.ID)
+				if err != nil || saved.RevisionNumber != 1 || saved.Status != state.DeploymentStatusCompleted {
+					t.Fatal("denied retry mutated the saved deployment")
+				}
+				audit, err := store.ListAuditEvents(10)
+				if err != nil || len(audit) != 0 {
+					t.Fatal("denied deployment created audit events")
+				}
+			}
+		})
+	}
+}
+
 func TestSuspendedInstallationDeniesJobsAndDeploymentAccess(t *testing.T) {
 	var suspended atomic.Bool
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -273,6 +384,115 @@ func TestDeploymentsShareJobsRepositoryAuthorization(t *testing.T) {
 }
 
 func TestRepositoryMemberCanDeployWithoutPrivateCatalogAccess(t *testing.T) {
+	testDeploymentTemplateAccess(t, false, "member")
+}
+
+func TestDeploymentPlatformServiceTemplateAccess(t *testing.T) {
+	for _, role := range []string{"admin", "member"} {
+		t.Run(role, func(t *testing.T) { testDeploymentTemplateAccess(t, true, role) })
+	}
+}
+
+func TestPlatformDeploymentRetryDoesNotRequireOrganizationOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name, template        string
+		membershipStatus      int
+		repositoryUnavailable bool
+		wantStatus            int
+	}{
+		{name: "membership forbidden", template: "public-base", membershipStatus: 403, wantStatus: 202},
+		{name: "membership unavailable", template: "public-base", membershipStatus: 503, wantStatus: 202},
+		{name: "private template denied", template: "deploy-template-a", membershipStatus: 403, wantStatus: 403},
+		{name: "repository access required", template: "public-base", membershipStatus: 403, repositoryUnavailable: true, wantStatus: 404},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var membershipCalls, catalogCalls atomic.Int32
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveActiveInstallationFixture(w, r, 987) {
+					return
+				}
+				switch r.URL.Path {
+				case "/user/memberships/orgs":
+					membershipCalls.Add(1)
+					w.WriteHeader(tc.membershipStatus)
+					fmt.Fprint(w, `{"message":"membership lookup unavailable"}`)
+				case "/user/installations/987/repositories":
+					if tc.repositoryUnavailable {
+						fmt.Fprint(w, `{"repositories":[]}`)
+					} else {
+						fmt.Fprint(w, `{"repositories":[{"id":42,"full_name":"acme/project","owner":{"id":600,"login":"acme"}}]}`)
+					}
+				default:
+					t.Errorf("unexpected GitHub request: %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer api.Close()
+			store := state.New(t.TempDir())
+			srv := newTestServer(t, store, api.URL, nil)
+			srv.Close()
+			srv.loopCtx = context.Background()
+			srv.sandboxHTTP = &http.Client{Transport: profileValidationTransportFunc(func(r *http.Request) (*http.Response, error) {
+				catalogCalls.Add(1)
+				if r.URL.Path != "/default-templates" {
+					t.Errorf("platform retry must only read the public catalog: %s", r.URL.Path)
+				}
+				return (deploymentTemplateTransport{}).RoundTrip(r)
+			})}
+			account, _, err := store.GetAccountByOAuthIdentity("github", "hubot-id")
+			if err != nil {
+				t.Fatal(err)
+			}
+			saveTestGitHubOAuthToken(t, store, account.ID, srv.cfg.AuthEncryptionKey.Value(), "user-token")
+			if _, err := store.UpsertGitHubInstallation(state.GitHubInstallation{AccountID: account.ID, InstallationID: 987, GitHubAccountID: 600, AccountType: "organization", AccountLogin: "acme"}); err != nil {
+				t.Fatal(err)
+			}
+			key, err := encryptSecret("fixture-platform-key", srv.cfg.AuthEncryptionKey.Value())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.UpsertSandboxServiceDefault(state.SandboxServiceDefault{Enabled: true, APIURL: "https://platform.example", APIKeyEncrypted: key, AudienceMode: state.SandboxServiceDefaultAudienceModeSelected}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.UpsertSandboxServiceDefaultAudience(state.SandboxServiceDefaultAudience{GitHubAccountID: 600, AccountType: "organization", AccountLogin: "acme"}); err != nil {
+				t.Fatal(err)
+			}
+			fixture := state.Deployment{ID: "membership-independent-retry", AccountID: account.ID, ScopeType: state.AccountScopeTypeGitHubInstall, ScopeID: 987, GitHubInstallationID: 987, RepositoryID: 42, RepositoryFullName: "acme/project", Ref: "refs/heads/main", CommitSHA: strings.Repeat("a", 40), ConfigPath: ".qiniu/deploy.yaml", SnapshotVersion: 1, SpecHash: "hash", SpecJSONEncrypted: "encrypted", DeploymentTemplateID: tc.template, Status: state.DeploymentStatusCompleted, ExpiresAt: time.Now().Add(time.Hour)}
+			if _, err := store.CreateDeployment(fixture); err != nil {
+				t.Fatal(err)
+			}
+			rec := deploymentAuthCall(srv, "POST", "/user/deployments/"+fixture.ID+"/retry", `{}`)
+			if rec.Code != tc.wantStatus || membershipCalls.Load() != 0 {
+				t.Fatalf("retry=%d, membership calls=%d; want status=%d without ownership lookup", rec.Code, membershipCalls.Load(), tc.wantStatus)
+			}
+			wantCatalogCalls := int32(1)
+			if tc.repositoryUnavailable {
+				wantCatalogCalls = 0
+			}
+			if catalogCalls.Load() != wantCatalogCalls {
+				t.Fatalf("public catalog calls=%d, want %d", catalogCalls.Load(), wantCatalogCalls)
+			}
+			saved, err := store.GetDeployment(fixture.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			audit, err := store.ListAuditEvents(10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantStatus == 202 {
+				if saved.RevisionNumber != 2 || saved.SandboxConfigSource != sandboxConfigSourceAdminDefault || len(audit) != 1 {
+					t.Fatal("retry did not persist the platform revision and audit")
+				}
+			} else if saved.RevisionNumber != 1 || saved.Status != state.DeploymentStatusCompleted || len(audit) != 0 {
+				t.Fatal("rejected retry mutated the deployment or audit history")
+			}
+		})
+	}
+}
+
+func testDeploymentTemplateAccess(t *testing.T, platform bool, role string) {
+	t.Helper()
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if serveActiveInstallationFixture(w, r, 987) {
 			return
@@ -280,7 +500,7 @@ func TestRepositoryMemberCanDeployWithoutPrivateCatalogAccess(t *testing.T) {
 
 		switch r.URL.Path {
 		case "/user/memberships/orgs":
-			fmt.Fprint(w, `[{"state":"active","role":"member","organization":{"id":600,"login":"acme"}}]`)
+			fmt.Fprintf(w, `[{"state":"active","role":%q,"organization":{"id":600,"login":"acme"}}]`, role)
 		case "/user/installations/987/repositories":
 			fmt.Fprint(w, `{"repositories":[{"id":42,"full_name":"acme/project","owner":{"id":600,"login":"acme"}}]}`)
 		case "/repos/acme/project/branches":
@@ -300,6 +520,16 @@ func TestRepositoryMemberCanDeployWithoutPrivateCatalogAccess(t *testing.T) {
 	srv.Close()
 	srv.loopCtx = context.Background()
 	srv.sandboxHTTP = deploymentTemplateTestClient()
+	var publicCatalogReads atomic.Int32
+	if platform {
+		srv.sandboxHTTP.Transport = profileValidationTransportFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/default-templates" {
+				t.Errorf("platform template checks must use only the public catalog: %s", r.URL.Path)
+			}
+			publicCatalogReads.Add(1)
+			return (deploymentTemplateTransport{}).RoundTrip(r)
+		})
+	}
 	account, _, err := store.GetAccountByOAuthIdentity("github", "hubot-id")
 	if err != nil {
 		t.Fatal(err)
@@ -313,16 +543,28 @@ func TestRepositoryMemberCanDeployWithoutPrivateCatalogAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertAccountPreference(state.AccountPreference{ScopeType: state.AccountScopeTypeGitHubInstall, ScopeID: 987, Namespace: accountPreferenceNamespaceSandbox, Key: accountPreferenceKeySandboxService, ValueJSON: `{"api_url":"https://us-south-1-sandbox.qiniuapi.com"}`}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.UpsertAccountSecret(state.AccountSecret{ScopeType: state.AccountScopeTypeGitHubInstall, ScopeID: 987, KeyType: state.AccountSecretTypeSandboxAPIKey, EncryptedValue: key}); err != nil {
-		t.Fatal(err)
+	if platform {
+		if _, err := store.UpsertSandboxServiceDefault(state.SandboxServiceDefault{Enabled: true, APIURL: "https://us-south-1-sandbox.qiniuapi.com", APIKeyEncrypted: key, AudienceMode: state.SandboxServiceDefaultAudienceModeSelected}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.UpsertSandboxServiceDefaultAudience(state.SandboxServiceDefaultAudience{GitHubAccountID: 600, AccountType: "organization", AccountLogin: "acme"}); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if _, err := store.UpsertAccountPreference(state.AccountPreference{ScopeType: state.AccountScopeTypeGitHubInstall, ScopeID: 987, Namespace: accountPreferenceNamespaceSandbox, Key: accountPreferenceKeySandboxService, ValueJSON: `{"api_url":"https://us-south-1-sandbox.qiniuapi.com"}`}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.UpsertAccountSecret(state.AccountSecret{ScopeType: state.AccountScopeTypeGitHubInstall, ScopeID: 987, KeyType: state.AccountSecretTypeSandboxAPIKey, EncryptedValue: key}); err != nil {
+			t.Fatal(err)
+		}
+
 	}
 	catalogPath := fmt.Sprintf("/user/deployment-templates?installation_id=%d", inst.ID)
-	for _, repo := range []string{"", "acme/hidden"} {
-		if rec := deploymentAuthCall(srv, "GET", catalogPath+"&repository_full_name="+repo, ""); rec.Code != 403 {
-			t.Fatalf("ungated catalog %d", rec.Code)
+	if role != "admin" {
+		for _, repo := range []string{"", "acme/hidden"} {
+			if rec := deploymentAuthCall(srv, "GET", catalogPath+"&repository_full_name="+repo, ""); rec.Code != 403 {
+				t.Fatalf("ungated catalog %d", rec.Code)
+			}
 		}
 	}
 	rec := deploymentAuthCall(srv, "GET", catalogPath+"&repository_full_name=acme/project", "")
@@ -345,9 +587,13 @@ func TestRepositoryMemberCanDeployWithoutPrivateCatalogAccess(t *testing.T) {
 			t.Fatalf("non-public choice %d %s", rec.Code, rec.Body.String())
 		}
 	}
+	beforeCreate := publicCatalogReads.Load()
 	rec = deploymentAuthCall(srv, "POST", "/user/deployments", payload("public-base"))
 	if rec.Code != 201 {
 		t.Fatalf("member create %d %s", rec.Code, rec.Body.String())
+	}
+	if platform && publicCatalogReads.Load()-beforeCreate != 1 {
+		t.Fatal("platform creation must validate publicness and runnable build in one catalog read")
 	}
 	var created deploymentResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
@@ -360,6 +606,22 @@ func TestRepositoryMemberCanDeployWithoutPrivateCatalogAccess(t *testing.T) {
 	if d.ExecutionAccountID != account.ID || d.ScopeType != state.AccountScopeTypeGitHubInstall || d.ScopeID != 987 {
 		t.Fatal("incorrect execution scope")
 	}
+	if platform {
+		if d.SandboxConfigSource != sandboxConfigSourceAdminDefault {
+			t.Fatal("deployment did not snapshot platform service")
+		}
+		d.Status = state.DeploymentStatusCompleted
+		if err := store.UpdateDeployment(d); err != nil {
+			t.Fatal(err)
+		}
+		beforeRetry := publicCatalogReads.Load()
+		if rec := deploymentAuthCall(srv, "POST", "/user/deployments/"+d.ID+"/retry", `{}`); rec.Code != 202 {
+			t.Fatalf("public platform retry: %d %s", rec.Code, rec.Body.String())
+		}
+		if publicCatalogReads.Load()-beforeRetry != 1 {
+			t.Fatal("platform retry must validate publicness and runnable build in one catalog read")
+		}
+	}
 	// Reuse an immutable private-template revision created by a different account.
 	d.AccountID = account.ID + 10
 	d.ExecutionAccountID = d.AccountID
@@ -371,6 +633,16 @@ func TestRepositoryMemberCanDeployWithoutPrivateCatalogAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec = deploymentAuthCall(srv, "POST", "/user/deployments/"+d.ID+"/retry", `{"mode":"revision","revision_number":1}`)
+	if platform {
+		if rec.Code != 403 || !strings.Contains(rec.Body.String(), "deployment_template_forbidden") {
+			t.Fatalf("private platform retry: %d %s", rec.Code, rec.Body.String())
+		}
+		saved, err := store.GetDeployment(d.ID)
+		if err != nil || saved.RevisionNumber != 1 || saved.Status != state.DeploymentStatusCompleted {
+			t.Fatal("rejected private platform retry mutated deployment")
+		}
+		return
+	}
 	if rec.Code != 202 {
 		t.Fatalf("shared retry %d %s", rec.Code, rec.Body.String())
 	}

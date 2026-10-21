@@ -227,19 +227,14 @@ func (s *Server) handleUserCreateDeployment(w http.ResponseWriter, r *http.Reque
 		writeErrorCode(w, http.StatusBadRequest, "deployment_template_required", "Select a Sandbox template before deploying")
 		return
 	}
-	service, sandboxSnapshot, snapshotErr := s.sandboxServiceForDeployment(r.Context(), scope)
+	service, sandboxSnapshot, snapshotErr := s.sandboxServiceForDeployment(r.Context(), scope, installation.InstallationID)
 	if snapshotErr != nil {
 		writeErrorCode(w, http.StatusConflict, "deployment_sandbox_not_configured", "Configure Sandbox credentials in this account or organization's Preferences before deploying")
 		return
 	}
-	if !s.authorizeDeploymentTemplate(w, r, account.ID, scope, service, templateID) {
+	if !s.authorizeDeploymentTemplate(w, r, account.ID, scope, service, sandboxSnapshot, templateID) {
 		return
 	}
-	if err := service.ValidateTemplate(r.Context(), templateID); err != nil {
-		writeErrorCode(w, http.StatusConflict, "deployment_template_unavailable", "The selected Sandbox template is unavailable or has no runnable default build")
-		return
-	}
-
 	sourceSnapshot, err := s.resolveDeploymentSource(r.Context(), repository, input.Ref, input.CommitSHA)
 	if err != nil {
 		if errors.Is(err, errDeploymentSourceChanged) {
@@ -556,7 +551,7 @@ func (s *Server) refreshDeploymentResources(ctx context.Context, deployment, sel
 	} else if s.sandbox != nil {
 		service = s.sandbox
 	} else {
-		resolved, _, err := s.sandboxServiceForDeployment(ctx, accountPreferenceScope{Type: deployment.ScopeType, ID: deployment.ScopeID})
+		resolved, _, err := s.sandboxServiceForDeployment(ctx, accountPreferenceScope{Type: deployment.ScopeType, ID: deployment.ScopeID}, deployment.GitHubInstallationID)
 		if err != nil {
 			return err
 		}
@@ -866,18 +861,26 @@ func (s *Server) handleUserRetryDeployment(w http.ResponseWriter, r *http.Reques
 		writeErrorCode(w, http.StatusConflict, "deployment_template_required", "Create a new deployment with an available Sandbox template")
 		return
 	}
-	service, snapshot, snapshotErr := s.sandboxServiceForDeployment(r.Context(), accountPreferenceScope{Type: deployment.ScopeType, ID: deployment.ScopeID})
+	scope := accountPreferenceScope{Type: deployment.ScopeType, ID: deployment.ScopeID}
+	service, snapshot, snapshotErr := s.sandboxServiceForDeployment(r.Context(), scope, deployment.GitHubInstallationID)
 	if snapshotErr != nil {
-		writeErrorCode(w, http.StatusConflict, "deployment_sandbox_not_configured", "Deploy requires configured scoped Sandbox credentials")
+		writeErrorCode(w, http.StatusConflict, "deployment_sandbox_not_configured", "Configure Sandbox credentials in this account or organization's Preferences before deploying")
 		return
 	}
-	if err := service.ValidateTemplate(r.Context(), deployment.DeploymentTemplateID); err != nil {
+	// Only platform credentials need the public-only admission gate. Applying
+	// it unconditionally would reject members replaying a saved scoped private
+	// template: they may use that binding without managing the scope.
+	if snapshot.Source == sandboxConfigSourceAdminDefault {
+		if !s.authorizeDeploymentTemplate(w, r, account.ID, scope, service, snapshot, deployment.DeploymentTemplateID) {
+			return
+		}
+	} else if err := service.ValidateTemplate(r.Context(), deployment.DeploymentTemplateID); err != nil {
 		writeErrorCode(w, http.StatusConflict, "deployment_template_unavailable", "The selected Sandbox template is unavailable or has no runnable default build")
 		return
 	}
-	// Repository members may replay an existing saved template binding, including
-	// an owner-created private template. Only new choices require the public-only
-	// catalog gate; retry cannot substitute an arbitrary template ID.
+	// Repository members may replay an existing saved scoped template binding,
+	// including an owner-created private template. Retry cannot substitute an
+	// arbitrary template ID.
 	deployment.ExecutionAccountID = account.ID
 	deployment.SandboxAPIURL, deployment.SandboxAPIKeyEncrypted, deployment.SandboxConfigSource = snapshot.APIURL, snapshot.EncryptedAPIKey, snapshot.Source
 	deployment.SandboxRegion = s.sandboxRegionForAPIURL(snapshot.APIURL)

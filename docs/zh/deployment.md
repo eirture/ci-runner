@@ -45,7 +45,7 @@ Sandbox 凭证放进计划。
 确认 PID 后，取消观察流不会停止服务；应用继续运行，直到手动停止或 Sandbox 到期。
 克隆和安装命令仍保留执行超时。
 
-创建部署时从所选账号或组织的可运行公共／自有 Sandbox 目录中选择模板。
+使用平台 Sandbox 服务时只能选择可运行的公共模板；使用 scope 凭据的 owner 也可以选择自有模板。
 `runnerd.yaml` 可以为未传 `template_id` 的 API 客户端配置可选默认值：
 
 ```yaml
@@ -54,7 +54,6 @@ deploy:
   work_root: /var/lib/runnerd/deployments
   max_concurrent_per_scope: 3
   retention_hours: 168
-  allow_admin_fallback: false
 ```
 
 `template_id` 与 Runner Spec 完全分离。`work_root` 是控制器拥有的绝对路径，
@@ -70,9 +69,20 @@ Provider 失败只向服务端日志记录操作名、错误类别及经过校�
 
 区域来自该 scope 的有效 Sandbox endpoint。准入时保存区域标识、endpoint、加密凭据
 和独立 Deploy 模板绑定，后续全局配置变更不会移动已准入部署的区域或模板。重试会重新解析
-当前 scope 的凭据，并按重新部署方式刷新分支源码或复用不可变源码与模板绑定。Deploy 默认不使用平台 CI 兜底；
-仅 `allow_admin_fallback: true` 时允许，且仍遵守已有的启用状态与 audience 限制。
-Deploy 不使用 Fork sponsorship 或 Cache S3 凭据。
+当前 Sandbox 凭据，并按重新部署方式刷新分支源码或复用不可变源码与模板绑定。
+Deploy 与 Jobs 使用相同的 Sandbox 服务资格规则：scope 自有或组织继承凭据优先，
+仅缺少配置时才使用已启用且 audience 允许的平台服务；损坏配置直接拒绝，不再额外要求 Deploy 开关。
+凭据 scope 与平台 audience 身份分别处理：个人仓库协作者继续使用自身账号凭据 scope，
+平台资格始终按仓库 Installation owner 的稳定 GitHub ID 与账号类型判断。
+仅选择协作者不能授权 owner 的仓库；选择 owner 后，已有精确仓库权限的协作者可以使用平台服务。
+模板发现、新建、重新部署及无快照旧记录解析均保留该 Installation ID。
+凭据在准入时保存，排队期间也沿用该快照，不受后续 audience 变更影响；重新部署时再解析当前资格。
+使用平台凭据时，owner 和普通成员都只能列出、选择可运行的公共模板，组织所有权不授予平台私有目录访问权。
+重新部署也要通过公共模板检查，包括删除 scope 凭据后尝试重放原有私有模板的情况。
+没有凭据快照的旧排队记录使用平台服务创建 Sandbox 前，也必须通过这项检查。
+使用 scope 凭据时，owner 保留自有／公共目录，仓库成员保留公共选项及已有私有绑定的重放能力。
+已运行部署的重连和清理继续使用保存的凭据快照，即使平台服务后来被禁用或 audience 改变。
+Deploy 不使用 Fork sponsorship、Runner Spec 匹配或 Cache S3 凭据。
 
 启动恢复只通知独立的 Deploy 调度器；恢复完成后启动后台循环并打开 HTTP 门禁，
 调度器使用独立 context 推进重连、补偿和排队计划。慢克隆／安装不会阻塞启动门禁，也不会
@@ -124,9 +134,11 @@ Deploy 不会继承 CI Secrets、Cache S3 凭证或 Fork sponsorship 权限。
 Installation ID 由服务端解析：
 
 - `GET /user/deployment-templates?installation_id=<local-id>&repository_full_name=<owner/repo>`
-  向作用域 owner 返回可运行的自有／公共模板。其他用户必须通过精确仓库授权，
-  只获得公共模板 ID 与名称，不返回私有目录或作用域元数据。非 owner 创建时只能
-  选择已验证的公共模板；仓库成员可以重新部署已有的保存版本。Deploy fallback 仍需明确启用。
+  仅向使用 scope 凭据的 owner 返回可运行的自有／公共模板。使用平台凭据时，
+  owner 也只能获得公共模板 ID 与名称。其他用户必须通过精确仓库授权，只获得
+  公共选项，不返回作用域元数据。平台回退使用共享的启用状态／audience 规则，
+  无需单独开启 Deploy。仓库成员可重放已保存的 scope 私有绑定；使用平台服务重新部署时，
+  仍须选择可运行的公共模板。公共模板准入只读取一次公共目录，同时确认公开性与有效默认构建。
 - `GET /user/deployment-refs?installation_id=<local-id>&repository_full_name=<owner/repo>&source=branch|tag|pull_request&page=1`
   每页最多返回 100 个引用名称及 `has_more`。读取前检查与创建相同的
   OAuth/App 精确仓库交集；OAuth 缺失或被拒绝时失败关闭。

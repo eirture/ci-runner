@@ -13,8 +13,8 @@ import (
 	"github.com/qiniu/ci-runner/internal/state"
 )
 
-// Owners may browse their scoped catalog. Repository members receive only
-// runnable public templates for deployment, never the private provider catalog.
+// Owners may browse their scoped catalog. Platform credentials and repository
+// members receive only runnable public templates, never a private catalog.
 func (s *Server) handleUserDeploymentTemplates(w http.ResponseWriter, r *http.Request) {
 	_, account, ok := s.requireUserSession(w, r)
 	if !ok {
@@ -57,13 +57,14 @@ func (s *Server) handleUserDeploymentTemplates(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
-	service, snapshot, err := s.sandboxServiceForDeployment(ctx, scope)
+	service, snapshot, err := s.sandboxServiceForDeployment(ctx, scope, installation.InstallationID)
 	if err != nil {
 		writeErrorCode(w, http.StatusConflict, "deployment_sandbox_not_configured", "Configure Sandbox credentials in this account or organization's Preferences before deploying")
 		return
 	}
 	var items []sandboxrunner.CatalogTemplate
-	if manageable {
+	privateCatalog := manageable && snapshot.Source != sandboxConfigSourceAdminDefault
+	if privateCatalog {
 		items, err = deploymentTemplates(ctx, service)
 	} else {
 		items, err = publicDeploymentTemplates(ctx, service)
@@ -72,7 +73,7 @@ func (s *Server) handleUserDeploymentTemplates(w http.ResponseWriter, r *http.Re
 		writeErrorCode(w, http.StatusBadGateway, "deployment_templates_unavailable", "Unable to load available deployment templates")
 		return
 	}
-	if !manageable {
+	if !privateCatalog {
 		w.Header().Set("Cache-Control", "no-store")
 		// Only public template choices; exclude private catalogs and scope metadata.
 		writeJSON(w, http.StatusOK, map[string]any{"templates": publicDeploymentTemplateOptions(items)})
@@ -120,6 +121,7 @@ func deploymentTemplates(ctx context.Context, service sandboxrunner.Service) ([]
 		if !item.Runnable() {
 			continue
 		}
+		// Defaults win ID collisions while retaining aliases from owned entries.
 		if previous, exists := byID[item.TemplateID]; exists {
 			item.Aliases = append(item.Aliases, previous.Aliases...)
 		}
@@ -158,25 +160,44 @@ func publicDeploymentTemplateOptions(items []sandboxrunner.CatalogTemplate) []pu
 	return result
 }
 
-func (s *Server) authorizeDeploymentTemplate(w http.ResponseWriter, r *http.Request, accountID int64, scope accountPreferenceScope, service sandboxrunner.Service, template string) bool {
-	manageable, err := s.accountPreferenceScopeManageable(r.Context(), accountID, scope)
-	if err != nil {
-		s.writeUserRepositoryAuthorizationError(w, err)
-		return false
+func (s *Server) authorizeDeploymentTemplate(w http.ResponseWriter, r *http.Request, accountID int64, scope accountPreferenceScope, service sandboxrunner.Service, snapshot sandboxServiceConfigSnapshot, template string) bool {
+	// Platform policy is public-only for every role; Settings ownership cannot
+	// affect it and must not add an organization-membership API dependency.
+	if snapshot.Source != sandboxConfigSourceAdminDefault {
+		manageable, err := s.accountPreferenceScopeManageable(r.Context(), accountID, scope)
+		if err != nil {
+			s.writeUserRepositoryAuthorizationError(w, err)
+			return false
+		}
+		if manageable {
+			if err := service.ValidateTemplate(r.Context(), template); err != nil {
+				writeErrorCode(w, http.StatusConflict, "deployment_template_unavailable", "The selected Sandbox template is unavailable or has no runnable default build")
+				return false
+			}
+			return true
+		}
 	}
-	if manageable {
-		return true
-	}
-	items, err := publicDeploymentTemplates(r.Context(), service)
+	allowed, err := publicDeploymentTemplateAllowed(r.Context(), service, template)
 	if err != nil {
 		writeErrorCode(w, http.StatusBadGateway, "deployment_templates_unavailable", "Unable to load available deployment templates")
 		return false
 	}
-	for _, item := range publicDeploymentTemplateOptions(items) {
-		if item.TemplateID == template {
-			return true
-		}
+	if allowed {
+		return true
 	}
 	writeErrorCode(w, http.StatusForbidden, "deployment_template_forbidden", "Select a public template for this deployment")
 	return false
+}
+
+func publicDeploymentTemplateAllowed(ctx context.Context, service sandboxrunner.Service, template string) (bool, error) {
+	items, err := publicDeploymentTemplates(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	for _, item := range items {
+		if item.TemplateID == template && item.Public && item.Runnable() {
+			return true, nil
+		}
+	}
+	return false, nil
 }
