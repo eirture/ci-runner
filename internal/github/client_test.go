@@ -234,6 +234,24 @@ func TestListRunnerApplicationsRejectsInvalidResponses(t *testing.T) {
 	}
 }
 
+func TestListRunnerApplicationsSkipsUnsupportedArchitectures(t *testing.T) {
+	const validChecksum = "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `[`+
+			`{"os":"win","architecture":"x86","download_url":"https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-win-x86-2.337.0.zip","filename":"actions-runner-win-x86-2.337.0.zip","sha256_checksum":"`+validChecksum+`"},`+
+			`{"os":"linux","architecture":"x64","download_url":"https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz","filename":"actions-runner-linux-x64-2.337.0.tar.gz","sha256_checksum":"`+validChecksum+`"}]`)
+	}))
+	defer ts.Close()
+
+	applications, err := NewClient(ts.URL, ts.Client()).ListRunnerApplications(t.Context(), "o/r", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applications) != 1 || applications[0].OS != "linux" || applications[0].Architecture != "x64" {
+		t.Fatalf("applications = %#v, want only the supported Linux x64 descriptor", applications)
+	}
+}
+
 func TestListRunnerApplicationsCachesValidatedResponse(t *testing.T) {
 	var requests atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

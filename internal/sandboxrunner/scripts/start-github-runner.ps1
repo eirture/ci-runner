@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
-# Invoke-WebRequest and Expand-Archive progress bars need a console buffer,
-# which processes started by envd do not have.
+# Progress bars need a console buffer, which processes started by envd do
+# not have.
 $ProgressPreference = 'SilentlyContinue'
 
 function Decode-Argument([string]$value) {
@@ -338,8 +338,9 @@ try {
   # Cache the process handle so ExitCode stays available after exit.
   $null = $runner.Handle
   $hookSignalRelayed = $false
-  while (-not $runner.HasExited) {
-    if (-not $hookSignalRelayed -and (Test-Path -LiteralPath $hookSignalPath -PathType Leaf)) {
+  # Poll only until the one marker is relayed, then block until exit.
+  while (-not $hookSignalRelayed -and -not $runner.WaitForExit(100)) {
+    if (Test-Path -LiteralPath $hookSignalPath -PathType Leaf) {
       # Relay at most one marker. Removing the file acknowledges it to the hook.
       $hookSignalRelayed = $true
       try {
@@ -351,12 +352,17 @@ try {
         # The hook timed out and removed the marker first.
       }
     }
-    Start-Sleep -Milliseconds 100
   }
   $runner.WaitForExit()
   $runnerExitCode = $runner.ExitCode
 } finally {
   Remove-Item -LiteralPath $hookSignalPath, "$hookSignalPath.tmp" -Force -ErrorAction SilentlyContinue
-  & $runnerListener remove --token $registrationToken
+  # Ephemeral runners usually unregister after their job, so removal often
+  # fails. Like the Linux path, ignore that and keep the runner exit code.
+  try {
+    & $runnerListener remove --token $registrationToken
+  } catch {
+    [Console]::Error.WriteLine('GitHub Actions runner removal failed')
+  }
 }
 exit $runnerExitCode

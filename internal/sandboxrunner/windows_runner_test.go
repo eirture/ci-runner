@@ -144,6 +144,25 @@ func TestWindowsStartScriptBoundsRunnerDownloadAcrossRetries(t *testing.T) {
 	}
 }
 
+func TestWindowsStartScriptToleratesRunnerRemovalFailure(t *testing.T) {
+	t.Parallel()
+	script := windowsStartScript(StartInput{Platform: PlatformWindows}, "sandbox-1")
+	cleanup := script[strings.LastIndex(script, "} finally {"):]
+	try := strings.Index(cleanup, "try {")
+	remove := strings.Index(cleanup, "& $runnerListener remove --token $registrationToken")
+	if try < 0 || remove < try || !strings.Contains(cleanup[remove:], "} catch {") || !strings.HasSuffix(strings.TrimSpace(script), "exit $runnerExitCode") {
+		t.Fatalf("runner removal can mask the runner exit code:\n%s", cleanup)
+	}
+}
+
+func TestWindowsStartScriptStopsPollingAfterMarkerRelay(t *testing.T) {
+	t.Parallel()
+	script := windowsStartScript(StartInput{Platform: PlatformWindows}, "sandbox-1")
+	if !strings.Contains(script, "while (-not $hookSignalRelayed -and -not $runner.WaitForExit(100)) {") || strings.Contains(script, "while (-not $runner.HasExited)") {
+		t.Fatal("start script polls for the whole job instead of blocking after the marker relay")
+	}
+}
+
 func TestWindowsStartScriptRestoresPreviousRunnerFromFinally(t *testing.T) {
 	t.Parallel()
 	script := windowsStartScript(StartInput{Platform: PlatformWindows}, "sandbox-1")
@@ -175,7 +194,7 @@ func TestWindowsJobStartedHookWaitsForMarkerConsumption(t *testing.T) {
 	if publish < 0 || wait < publish || drop < wait {
 		t.Fatalf("hook does not wait for consumption and drop an unconsumed marker:\n%s", hook)
 	}
-	relay := script[strings.Index(script, "if (-not $hookSignalRelayed"):]
+	relay := script[strings.Index(script, "while (-not $hookSignalRelayed"):]
 	if strings.Index(relay, "$hookSignalRelayed = $true") > strings.Index(relay, "ReadAllText($hookSignalPath)") {
 		t.Fatal("relay can forward more than one marker")
 	}
@@ -309,9 +328,15 @@ echo 'Status: ready'
 			t.Fatalf("Windows Dockerfile does not contain %q:\n%s", want, dockerfile)
 		}
 	}
-	// Windows envd rejects root, and the Linux Runner archive chunks are unused.
-	if strings.Contains(string(dockerfile), "USER root") || strings.Contains(string(dockerfile), "common/.build") {
-		t.Fatalf("Windows Dockerfile uses Linux-only build steps:\n%s", dockerfile)
+	// The Windows builder ignores USER, and the Linux Runner archive chunks
+	// are unused. Comments may still describe qshell's Linux defaults.
+	for line := range strings.SplitSeq(string(dockerfile), "\n") {
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Contains(line, "USER root") || strings.Contains(line, "common/.build") {
+			t.Fatalf("Windows Dockerfile uses a Linux-only build step: %s", line)
+		}
 	}
 }
 

@@ -590,7 +590,7 @@ func (s *E2BService) StartRunner(ctx context.Context, input StartInput) (StartRe
 	// An empty manifest skips preflight, so resolved applications without one
 	// for this platform must fail before a Sandbox exists.
 	if len(input.RunnerApplications) > 0 && !HasRunnerApplication(input.Platform, input.RunnerApplications) {
-		return StartResult{}, fmt.Errorf("%w for platform %s", ErrRunnerApplicationMissing, input.Platform.runnerApplicationOS())
+		return StartResult{}, fmt.Errorf("%w for platform %s", ErrRunnerApplicationMissing, input.Platform)
 	}
 	timeout := sandboxTimeoutSeconds(input.Timeout)
 	allowInternet := true
@@ -609,9 +609,11 @@ func (s *E2BService) StartRunner(ctx context.Context, input StartInput) (StartRe
 	}
 	runtimeEnvironment := readRuntimeEnvironment(ctx, sb, input.Platform)
 
-	scriptPath, script, cmd := "/tmp/start-github-runner.sh", startScript(input, sb.ID()), "chmod +x /tmp/start-github-runner.sh && /tmp/start-github-runner.sh"
+	var scriptPath, script, cmd string
 	if input.Platform == PlatformWindows {
 		scriptPath, script, cmd = windowsStartRunnerScriptPath, windowsStartScript(input, sb.ID()), windowsStartRunnerCommand
+	} else {
+		scriptPath, script, cmd = "/tmp/start-github-runner.sh", startScript(input, sb.ID()), "chmod +x /tmp/start-github-runner.sh && /tmp/start-github-runner.sh"
 	}
 	if _, err := sb.Files().Write(ctx, scriptPath, []byte(script)); err != nil {
 		_ = sb.Kill(ctx)

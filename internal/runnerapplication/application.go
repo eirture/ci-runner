@@ -74,6 +74,12 @@ func Normalize(application Application) (Application, error) {
 	return application, nil
 }
 
+// SupportedArchitecture reports whether runnerd can install the official
+// Runner for os and architecture.
+func SupportedArchitecture(os, architecture string) bool {
+	return validateArchitecture(os, architecture) == nil
+}
+
 func validateArchitecture(os, architecture string) error {
 	switch {
 	case os == OSLinux && (architecture == "x64" || architecture == "arm64" || architecture == "arm"):

@@ -484,6 +484,7 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 			return
 		}
 	}
+	platform := sandboxrunner.PlatformForLabels(req.Labels)
 	if profile.TemplateSource != state.TemplateSourcePublic {
 		s.logger.Info("resolving github runner applications", "id", id)
 		s.store.AppendLog(id, "control.log", []byte("resolving github runner applications for preflight update\n"))
@@ -492,9 +493,8 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 			s.failStart(id, st, "github_runner_downloads", err)
 			return
 		}
-		platform := sandboxrunner.PlatformForLabels(req.Labels)
 		if !sandboxrunner.HasRunnerApplication(platform, applications) {
-			s.failStart(id, st, "github_runner_downloads", fmt.Errorf("%w for the %s platform", sandboxrunner.ErrRunnerApplicationMissing, platform))
+			s.failStart(id, st, "github_runner_downloads", fmt.Errorf("%w for platform %s", sandboxrunner.ErrRunnerApplicationMissing, platform))
 			return
 		}
 		runnerApplications = append([]sandboxrunner.RunnerApplication(nil), applications...)
@@ -523,7 +523,6 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 		}
 
 		// Generate cache STS credentials for this repository if cache is configured.
-		platform := sandboxrunner.PlatformForLabels(req.Labels)
 		// Windows runners do not provide Docker.
 		requireDocker := profile.TemplateSource == state.TemplateSourcePublic && platform != sandboxrunner.PlatformWindows
 		input := sandboxrunner.StartInput{

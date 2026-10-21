@@ -93,8 +93,10 @@ Public runner templates are built with `qiniu/qshell` 2.19.13 or newer.
 The preview `github-runner-windows-11` template also uses qshell, but its
 `qshell.sandbox.toml` sets `from_template = "windows11"` because Windows
 Sandbox templates cannot start from a Docker image; qshell ignores the
-Dockerfile `FROM`. The Windows builder ignores `USER` and runs `RUN` steps
-through `cmd.exe`; the Dockerfile uses the `` ` `` escape directive and COPYs the pinned setup script and `template.env`
+Dockerfile `FROM`. The Windows builder ignores `USER`, including qshell's
+prepended `USER root`, and runs `RUN` steps through `cmd.exe`; the explicit
+`USER user` and `WORKDIR C:\runner` only replace qshell's appended Linux
+defaults. The Dockerfile uses the `` ` `` escape directive and COPYs the pinned setup script and `template.env`
 (`task template-build-windows-11`). Neither file may contain a template ID,
 `TEMPLATE_NAME` must equal the toml `name`, and its Windows Runner pin must
 equal the common `RUNNER_VERSION`. runnerd selects the Windows launch path when
