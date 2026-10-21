@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -43,13 +44,82 @@ func TestDeploymentTerminalOutputSurvivesHTTPWriteTimeout(t *testing.T) {
 			session.append([]byte(fmt.Sprintf("output %d", i)))
 		}
 	}()
-	scanner := bufio.NewScanner(resp.Body)
+	if terminalOutputContains(t, resp.Body, "output 7") {
+		return
+	}
+	t.Fatal("active terminal disconnected before the final output")
+}
+
+func TestDeploymentTerminalOutputWithServerTimeouts(t *testing.T) {
+	for _, http2 := range []bool{false, true} {
+		t.Run(fmt.Sprint("http2=", http2), func(t *testing.T) {
+			srv := &Server{terminals: newTerminalHub(nil)}
+			defer srv.terminals.Close()
+			session := srv.terminals.Add("deployment:active", "sandbox", &fakeTerminalSession{})
+			httpServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				srv.streamTerminalSession(&loggingResponseWriter{ResponseWriter: w}, r, session)
+			}))
+			httpServer.Config.WriteTimeout = 100 * time.Millisecond
+			httpServer.Config.ReadTimeout = 50 * time.Millisecond
+			httpServer.EnableHTTP2 = http2
+			httpServer.StartTLS()
+			defer httpServer.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, "GET", httpServer.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := httpServer.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			go func() {
+				for i := range 8 {
+					time.Sleep(40 * time.Millisecond)
+					session.append([]byte(fmt.Sprintf("output %d", i)))
+				}
+			}()
+			if terminalOutputContains(t, resp.Body, "output 7") {
+				return
+			}
+			t.Fatal("active terminal disconnected before the final output")
+		})
+	}
+}
+
+// Output can be coalesced into one SSE frame or split across several frames.
+func terminalOutputContains(t *testing.T, body io.Reader, marker string) bool {
+	t.Helper()
+	scanner := bufio.NewScanner(body)
+	var output strings.Builder
 	for scanner.Scan() {
-		if scanner.Text() == `data: "output 7"` {
-			return
+		if data, ok := strings.CutPrefix(scanner.Text(), "data: "); ok {
+			var chunk string
+			if json.Unmarshal([]byte(data), &chunk) == nil {
+				output.WriteString(chunk)
+				if strings.Contains(output.String(), marker) {
+					return true
+				}
+			}
 		}
 	}
-	t.Fatalf("active terminal disconnected at the HTTP response deadline: %v", scanner.Err())
+	if err := scanner.Err(); err != nil {
+		t.Logf("terminal stream ended: %v", err)
+	}
+	return false
+}
+
+func TestTerminalOutputAssertionAcceptsCoalescedAndSplitFrames(t *testing.T) {
+	for _, frames := range []string{
+		"data: \"output 6output 7\"\n\n",
+		"data: \"output \"\n\ndata: \"7\"\n\n",
+	} {
+		if !terminalOutputContains(t, strings.NewReader(frames), "output 7") {
+			t.Fatalf("final marker not found in %q", frames)
+		}
+	}
 }
 
 func TestDeploymentTerminalIdleStreamHeartbeat(t *testing.T) {
@@ -76,13 +146,16 @@ func TestDeploymentTerminalIdleStreamHeartbeat(t *testing.T) {
 			time.Sleep(15 * time.Second)
 			synctest.Wait()
 		}
-		if strings.Count(rec.Body.String(), ": keepalive\n\n") != 2 {
+		if strings.Count(rec.Body.String(), ": keepalive\n\n") != 6 {
 			t.Fatalf("idle stream has no periodic SSE heartbeat: %q", rec.Body.String())
 		}
 		session.append([]byte("shell output\r\n"))
 		synctest.Wait()
 		if !strings.Contains(rec.Body.String(), `data: "shell output\r\n"`) {
 			t.Fatalf("heartbeat interrupted terminal output: %q", rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "id: 0\nevent: terminal-heartbeat\ndata: {}") {
+			t.Fatal("idle heartbeat does not confirm recovery with a replay cursor")
 		}
 		if session.terminal.(*fakeTerminalSession).isClosed() {
 			t.Fatal("an attached idle terminal was closed")
@@ -326,4 +399,162 @@ func TestDeploymentTerminalRejectsChangedAttempt(t *testing.T) {
 			t.Fatalf("accepted stale attempt %#v", changed)
 		}
 	}
+}
+
+func TestDeploymentTerminalResumesWithoutDuplicateOutput(t *testing.T) {
+	srv := &Server{terminals: newTerminalHub(nil)}
+	defer srv.terminals.Close()
+	term := &fakeTerminalSession{}
+	session := srv.terminals.Add("deployment:resume", "sandbox", term)
+	session.append([]byte("first\n"))
+	stream := func(lastID string) string {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
+		req.Header.Set("Last-Event-ID", lastID)
+		rec := httptest.NewRecorder()
+		// Cancel after headers/output have been flushed, simulating a proxy closing
+		// just the SSE request while the PTY continues to produce output.
+		writer := &terminalCancelWriter{ResponseRecorder: rec, cancel: cancel}
+		srv.streamTerminalSession(writer, req, session)
+		return rec.Body.String()
+	}
+	if got := stream(""); !strings.Contains(got, "id: 6\ndata: \"first\\n\"") {
+		t.Fatalf("initial cursor/output missing: %q", got)
+	}
+	session.append([]byte("second\n"))
+	if got := stream("6"); !strings.Contains(got, "id: 13\ndata: \"second\\n\"") || strings.Contains(got, "first") {
+		t.Fatalf("resume duplicated or lost output: %q", got)
+	}
+	if got := stream("13"); strings.Contains(got, "data:") {
+		t.Fatalf("up-to-date cursor replayed output: %q", got)
+	}
+	if term.isClosed() {
+		t.Fatal("SSE interruption closed the PTY")
+	}
+	session.append([]byte(strings.Repeat("x", 128<<10)))
+	for _, id := range []string{"", "6", "999999999999", "invalid", "-1"} {
+		if got := stream(id); !strings.Contains(got, "event: terminal-closed") || strings.Contains(got, "data: \"x") {
+			t.Fatalf("invalid or evicted cursor %q silently resumed: %q", id, got)
+		}
+	}
+}
+
+type terminalCancelWriter struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+}
+
+func (w *terminalCancelWriter) Flush() {
+	w.ResponseRecorder.Flush()
+	w.cancel()
+}
+
+func TestDeploymentTerminalClosedStreamDoesNotReplayOutput(t *testing.T) {
+	srv := &Server{terminals: newTerminalHub(nil)}
+	defer srv.terminals.Close()
+	session := srv.terminals.Add("deployment:revoked", "sandbox", &fakeTerminalSession{})
+	session.append([]byte("must not replay after revocation"))
+	session.closeWatchers()
+	rec := httptest.NewRecorder()
+	srv.streamTerminalSession(rec, httptest.NewRequest("GET", "/events", nil), session)
+	if !strings.Contains(rec.Body.String(), "event: terminal-closed") || strings.Contains(rec.Body.String(), "must not replay") {
+		t.Fatalf("closed shell resumed output: %q", rec.Body.String())
+	}
+}
+
+func TestTerminalReplayBaselinePrecedesFirstOutputRead(t *testing.T) {
+	hub := newTerminalHub(nil)
+	defer hub.Close()
+	session := hub.Add("deployment:first-read", "sandbox", &fakeTerminalSession{})
+	_, _, unsubscribe := session.Subscribe()
+	defer unsubscribe()
+	// Output may overrun the tail after subscription but before the first write.
+	session.append([]byte(strings.Repeat("x", (128<<10)+1)))
+	if _, _, ok := session.outputAfter(nil); ok {
+		t.Fatal("first output read silently moved the subscription baseline")
+	}
+}
+
+func TestTerminalHubReconnectGetsFullIdleGrace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		hub := newTerminalHub(nil)
+		defer hub.Close()
+		defer func() { time.Sleep(time.Minute); synctest.Wait() }()
+		term := &fakeTerminalSession{}
+		session := hub.Add("deployment:idle-grace", "sandbox", term)
+		hub.CloseSessionWhenIdle(session.id, 30*time.Second)
+		_, _, firstCancel := session.Subscribe()
+		synctest.Wait()
+		time.Sleep(25 * time.Second)
+		firstCancel()
+		hub.CloseSessionWhenIdle(session.id, 30*time.Second)
+		_, _, secondCancel := session.Subscribe()
+		time.Sleep(4 * time.Second)
+		secondCancel()
+		hub.CloseSessionWhenIdle(session.id, 30*time.Second)
+		synctest.Wait()
+		time.Sleep(27 * time.Second) // Old creation/disconnect timers have both fired.
+		synctest.Wait()
+		if term.isClosed() {
+			t.Fatal("an old idle timer closed a recently disconnected PTY")
+		}
+		time.Sleep(4 * time.Second)
+		synctest.Wait()
+		if !term.isClosed() {
+			t.Fatal("disconnected terminal survived its full idle grace")
+		}
+	})
+}
+
+func TestDeploymentTerminalSurvivesShortProxyIdleTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := &Server{terminals: newTerminalHub(nil)}
+		defer srv.terminals.Close()
+		session := srv.terminals.Add("deployment:short-proxy-idle", "sandbox", &fakeTerminalSession{})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		rec := httptest.NewRecorder()
+		// A proxy's read-idle timeout is reset by response bytes, not by keyboard
+		// POSTs or ordinary detail polling on other HTTP requests.
+		idle := time.AfterFunc(10*time.Second, cancel)
+		defer idle.Stop()
+		writer := &terminalProxyIdleWriter{ResponseRecorder: rec, idle: idle}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			srv.streamTerminalSession(writer, httptest.NewRequest("GET", "/events", nil).WithContext(ctx), session)
+		}()
+		defer func() {
+			cancel()
+			<-done
+			time.Sleep(terminalIdleCloseDelay + time.Second)
+			synctest.Wait()
+		}()
+		synctest.Wait()
+		// Output stays active for over a minute, with gaps longer than this proxy's
+		// idle limit. Heartbeats must bridge every gap, including an idle shell.
+		for i := range 7 {
+			time.Sleep(12 * time.Second)
+			synctest.Wait()
+			if ctx.Err() != nil {
+				t.Fatalf("terminal disconnected at proxy idle timeout before output %d", i)
+			}
+			session.append([]byte(fmt.Sprintf("periodic output %d", i)))
+			synctest.Wait()
+		}
+		if !strings.Contains(rec.Body.String(), `data: "periodic output 6"`) {
+			t.Fatal("continuous output did not survive beyond one minute")
+		}
+	})
+}
+
+type terminalProxyIdleWriter struct {
+	*httptest.ResponseRecorder
+	idle *time.Timer
+}
+
+func (w *terminalProxyIdleWriter) Flush() {
+	w.ResponseRecorder.Flush()
+	w.idle.Reset(10 * time.Second)
 }

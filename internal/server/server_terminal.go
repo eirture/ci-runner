@@ -78,10 +78,13 @@ type terminalSession struct {
 	terminal  sandboxrunner.TerminalSession
 	createdAt time.Time
 
-	mu       sync.Mutex
-	buffer   []byte
-	watchers map[chan []byte]struct{}
-	closed   bool
+	mu          sync.Mutex
+	buffer      []byte
+	offset      uint64  // total output bytes, including the evicted buffer prefix
+	replayStart *uint64 // first cursorless subscription baseline
+	watchers    map[chan []byte]struct{}
+	closed      bool
+	idleSince   time.Time
 }
 
 func newTerminalHub(logger *slog.Logger) *terminalHub {
@@ -98,6 +101,7 @@ func (h *terminalHub) Add(requestID, sandboxID string, terminal sandboxrunner.Te
 		sandboxID: sandboxID,
 		terminal:  terminal,
 		createdAt: time.Now().UTC(),
+		idleSince: time.Now(),
 		watchers:  map[chan []byte]struct{}{},
 	}
 	h.mu.Lock()
@@ -131,6 +135,7 @@ func (h *terminalHub) CloseSessionWhenIdle(sessionID string, delay time.Duration
 	if delay < 0 {
 		delay = 0
 	}
+	idleBefore := time.Now()
 	go func() {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
@@ -138,7 +143,7 @@ func (h *terminalHub) CloseSessionWhenIdle(sessionID string, delay time.Duration
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		session, closed, err := h.closeSessionIfIdle(ctx, sessionID)
+		session, closed, err := h.closeSessionIfIdle(ctx, sessionID, idleBefore)
 		if !closed || session == nil {
 			return
 		}
@@ -148,7 +153,7 @@ func (h *terminalHub) CloseSessionWhenIdle(sessionID string, delay time.Duration
 	}()
 }
 
-func (h *terminalHub) closeSessionIfIdle(ctx context.Context, sessionID string) (*terminalSession, bool, error) {
+func (h *terminalHub) closeSessionIfIdle(ctx context.Context, sessionID string, idleBefore time.Time) (*terminalSession, bool, error) {
 	h.mu.Lock()
 	session, ok := h.sessions[sessionID]
 	if !ok {
@@ -156,7 +161,7 @@ func (h *terminalHub) closeSessionIfIdle(ctx context.Context, sessionID string) 
 		return nil, false, state.ErrNotFound
 	}
 	session.mu.Lock()
-	if session.closed || len(session.watchers) > 0 {
+	if session.closed || len(session.watchers) > 0 || session.idleSince.After(idleBefore) {
 		session.mu.Unlock()
 		h.mu.Unlock()
 		return session, false, nil
@@ -197,6 +202,7 @@ func (s *terminalSession) append(data []byte) {
 		return
 	}
 	s.mu.Lock()
+	s.offset += uint64(len(data))
 	s.buffer = append(s.buffer, data...)
 	const maxBuffer = 64 << 10
 	if len(s.buffer) > maxBuffer*2 {
@@ -215,6 +221,10 @@ func (s *terminalSession) Subscribe() ([]byte, <-chan []byte, func()) {
 	ch := make(chan []byte, 32)
 	s.mu.Lock()
 	initial := append([]byte(nil), s.buffer...)
+	if s.replayStart == nil {
+		start := s.offset - uint64(len(s.buffer))
+		s.replayStart = &start
+	}
 	if s.closed {
 		close(ch)
 		s.mu.Unlock()
@@ -226,11 +236,38 @@ func (s *terminalSession) Subscribe() ([]byte, <-chan []byte, func()) {
 		s.mu.Lock()
 		if _, ok := s.watchers[ch]; ok {
 			delete(s.watchers, ch)
+			if len(s.watchers) == 0 {
+				s.idleSince = time.Now()
+			}
 			close(ch)
 		}
 		s.mu.Unlock()
 	}
 	return initial, ch, cancel
+}
+
+// outputAfter returns a consistent replay snapshot. A cursor outside the retained
+// tail fails rather than replaying duplicate output or silently skipping a gap.
+func (s *terminalSession) outputAfter(after *uint64) ([]byte, uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, s.offset, false
+	}
+	bufferStart := s.offset - uint64(len(s.buffer))
+	if after == nil {
+		if s.replayStart == nil {
+			start := bufferStart
+			s.replayStart = &start
+		}
+		after = s.replayStart
+	}
+	if *after < bufferStart || *after > s.offset {
+		return nil, s.offset, false
+	}
+	start := *after
+
+	return append([]byte(nil), s.buffer[start-bufferStart:]...), s.offset, true
 }
 
 func (s *terminalSession) closeWatchers() {
@@ -626,23 +663,49 @@ func (s *Server) streamTerminalSession(w http.ResponseWriter, r *http.Request, s
 	if err := controller.Flush(); err != nil {
 		return
 	}
-	initial, ch, cancel := session.Subscribe()
+
+	_, ch, cancel := session.Subscribe()
 	defer func() {
 		cancel()
 		s.terminals.CloseSessionWhenIdle(session.id, terminalIdleCloseDelay)
 	}()
-	if len(initial) > 0 {
-		if !prepareWrite() {
+	var cursor *uint64
+	if id := r.Header.Get("Last-Event-ID"); id != "" {
+		offset, err := strconv.ParseUint(id, 10, 64)
+		if err != nil {
+			_, _ = io.WriteString(w, "event: terminal-closed\ndata: {}\n\n")
+			_ = controller.Flush()
 			return
 		}
-		writeTerminalEvent(w, initial)
-		if err := controller.Flush(); err != nil {
-			return
-		}
+		cursor = &offset
 	}
+	writeOutput := func() bool {
+		data, offset, ok := session.outputAfter(cursor)
+		if !ok {
+			_, _ = io.WriteString(w, "event: terminal-closed\ndata: {}\n\n")
+			_ = controller.Flush()
+			return false
+		}
+		cursor = &offset
+		if len(data) == 0 {
+			return true
+		}
+		if !prepareWrite() {
+			return false
+		}
+		if err := writeTerminalEvent(w, data, offset); err != nil {
+			return false
+		}
+		return controller.Flush() == nil
+	}
+	if !writeOutput() {
+		return
+	}
+
 	// An idle shell has no output. Keep proxies from timing out its SSE stream;
-	// comments do not enter the terminal output or extend the Sandbox lifetime.
-	heartbeat := time.NewTicker(15 * time.Second)
+	// five-second interval also covers proxies with a ten-second read-idle limit.
+	// Comments do not enter terminal output or extend the Sandbox lifetime.
+	heartbeat := time.NewTicker(5 * time.Second)
 	defer heartbeat.Stop()
 	for {
 		select {
@@ -652,21 +715,23 @@ func (s *Server) streamTerminalSession(w http.ResponseWriter, r *http.Request, s
 			if !prepareWrite() {
 				return
 			}
-			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+			if _, err := fmt.Fprintf(w, ": keepalive\n\nid: %d\nevent: terminal-heartbeat\ndata: {}\n\n", *cursor); err != nil {
 				return
 			}
 			if err := controller.Flush(); err != nil {
 				return
 			}
-		case data, ok := <-ch:
+		case _, ok := <-ch:
 			if !ok {
+				if prepareWrite() {
+					_, _ = io.WriteString(w, "event: terminal-closed\ndata: {}\n\n")
+					_ = controller.Flush()
+				}
 				return
 			}
-			if !prepareWrite() {
-				return
-			}
-			writeTerminalEvent(w, data)
-			if err := controller.Flush(); err != nil {
+			// The channel wakes the writer; the retained tail also recovers output
+			// coalesced when the bounded watcher channel was full.
+			if !writeOutput() {
 				return
 			}
 		}
@@ -1046,7 +1111,8 @@ func hasInt64(values []int64, needle int64) bool {
 	return false
 }
 
-func writeTerminalEvent(w io.Writer, data []byte) {
+func writeTerminalEvent(w io.Writer, data []byte, offset uint64) error {
 	payload, _ := json.Marshal(string(data))
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+	_, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", offset, payload)
+	return err
 }

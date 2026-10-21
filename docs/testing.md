@@ -648,6 +648,12 @@ Common issues:
   fresh Sandbox root disk meets `disk_size_mb` from the selected TOML.
   Confirm the provider team's `DiskMb`, then follow the
   [same-name rebuild steps](default-runner-templates.md) and repeat smoke.
+- Template conformance or release smoke loses `stdout.raw` or its temporary
+  directory: verify cleanup runs only in the main shell. A watchdog terminated
+  during Bash startup can invoke an inherited EXIT trap; it must not remove the
+  main shell's files or kill its Sandbox. Run `go test ./internal/sandboxrunner
+  -run 'TestSandboxConformance|TestTemplateReleaseSmoke' -count=1` for cleanup,
+  timeout and release-evidence regressions.
 - registration token fails: check the [GitHub App permission table](../README.md#required-permissions). Specs without `runner_group` require repository `Administration`; specs with `runner_group` require organization `Self-hosted runners`. Group lookup also needs that organization permission. `runner_group_not_supported` means the scope is not an organization. `runner_group_not_found` means the group is missing or inherited from an enterprise; `runner_group_repository_denied` means the target repository cannot use it. `runner_group_permission_denied`, `runner_group_rate_limited`, `runner_group_timeout` and `runner_group_unavailable` distinguish lookup failures without exposing upstream responses. See [GitHub Runner groups](platform-runner-specs.md#github-runner-groups) for form, YAML and validation behavior.
 
 ## 9. How To Read GitHub Actions Logs
@@ -915,6 +921,21 @@ conflicts, source-prefix length limits, and unauthorized discovery before provid
 Deployment revision verification must cover initial #1, atomic next-version creation and audit rollback, frozen old state, revision-scoped cursor pages, stale-output rejection, repeated legacy SQLite upgrade, Postgres/MySQL schema and mutations, URL-restored selection, and delayed-response isolation. Verify the history/log columns stack on a narrow screen and read without provider calls.
 
 ### Deployment terminal checks
+
+Reconnect regression checks additionally cover a ten-second proxy read-idle
+limit across more than a minute of periodic output, HTTP/1.1 and HTTP/2 server
+read/write deadlines, byte-offset suffix replay without duplicates, invalid or
+evicted cursors, closed-session output rejection, and stale idle timers. Run
+`cd ui && bun run test:production --grep 'resumes deployment terminal'` for real
+Chromium EventSource transport loss followed by resume on the same PTY, permission
+denial, explicit server closure, repeated empty reconnects, idle-heartbeat recovery, and the twenty-second outage limit. These are
+local transport fixtures, not proof that the production ingress keeps a stream
+open. Production acceptance must run continuous output and an idle shell for more
+than one minute, confirm the same PID survives a transport recovery, then verify
+stop/expiry and access revocation still close it. Keep runnerd and ingress logs
+when diagnosing the initial transport close; heartbeat and local deadline tests
+alone cannot identify a proxy's total request limit.
+
 
 Run `go test ./internal/server ./internal/sandboxrunner -run 'TestDeploymentTerminal|TestDeploymentsShareJobs|TestDeploymentReadsAndMutations|TestUser.*Terminal|TestTerminalHub' -count=1` for PTY input/resize/close, repository authorization and per-user session ownership, revision/attempt identity, stopped/expired rejection, and remaining-lifetime Connect coverage. Run `cd ui && bun run test:production --grep 'separates deployment'` for browser tab navigation, manual connection, typing and disconnect with fixture APIs/output. Fixtures do not prove a real Sandbox PTY. For live acceptance, open a running revision, connect, run `pwd` and inspect an application log file, resize, disconnect, reconnect, then stop the deployment and confirm the terminal becomes unavailable. Historical revisions must never open the current Sandbox.
 

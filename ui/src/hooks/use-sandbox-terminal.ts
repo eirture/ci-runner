@@ -35,10 +35,15 @@ export function useSandboxTerminal({
   const eventSourceRef = useRef<EventSource | null>(null)
   const terminalDataDisposableRef = useRef<{ dispose: () => void } | null>(null)
   const terminalSessionRef = useRef<SandboxTerminalSession | null>(null)
+  const reconnectTimeoutRef = useRef<number | null>(null)
   const resizeTimeoutRef = useRef<number | null>(null)
 
   const closeTerminalSession = useCallback(
     (session = terminalSessionRef.current) => {
+      if (reconnectTimeoutRef.current !== null) {
+        window.clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
       eventSourceRef.current?.close()
       eventSourceRef.current = null
       terminalDataDisposableRef.current?.dispose()
@@ -125,7 +130,23 @@ export function useSandboxTerminal({
         withCredentials: true,
       })
       eventSourceRef.current = events
+      const streamFailed = () => {
+        if (eventSourceRef.current !== events) return
+        setTerminalError(streamDisconnectedMessage)
+        closeTerminalSession(session)
+      }
+      const streamRecovered = () => {
+        if (eventSourceRef.current !== events) return
+        if (reconnectTimeoutRef.current !== null) {
+          window.clearTimeout(reconnectTimeoutRef.current)
+          reconnectTimeoutRef.current = null
+        }
+      }
+      events.addEventListener("terminal-closed", streamFailed)
+      events.addEventListener("terminal-heartbeat", streamRecovered)
       events.onmessage = (event) => {
+        if (eventSourceRef.current !== events) return
+        streamRecovered()
         try {
           term.write(JSON.parse(event.data) as string)
         } catch {
@@ -133,8 +154,17 @@ export function useSandboxTerminal({
         }
       }
       events.onerror = () => {
-        setTerminalError(streamDisconnectedMessage)
-        closeTerminalSession(session)
+        if (eventSourceRef.current !== events) return
+        // Let EventSource resume the same PTY with Last-Event-ID. Bound the
+        // outage below the server's 30-second idle cleanup. Only output or a
+        // server heartbeat confirms recovery; headers alone must not reset it.
+        // Repeated failures
+        // cannot keep an orphaned shell alive indefinitely.
+        if (events.readyState === EventSource.CLOSED) {
+          streamFailed()
+        } else if (reconnectTimeoutRef.current === null) {
+          reconnectTimeoutRef.current = window.setTimeout(streamFailed, 20_000)
+        }
       }
       let inputClosed = false
       let inputSending = false
