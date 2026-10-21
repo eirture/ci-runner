@@ -84,8 +84,10 @@ foreach ($directory in @($runnerRoot, $workdir, $runnerJobWork, $hookRoot, $env:
 }
 Set-Location -LiteralPath $workdir
 
-$runnerConfig = Join-Path $workdir 'config.cmd'
-if (-not (Test-Path -LiteralPath $runnerConfig -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $actionsRunnerRoot 'config.cmd') -PathType Leaf)) {
+# config.cmd only forwards its arguments to Runner.Listener.exe. Invoke the listener
+# directly so cmd.exe never reparses values such as a Runner Group named R&D.
+$runnerListener = Join-Path $workdir 'bin\Runner.Listener.exe'
+if (-not (Test-Path -LiteralPath $runnerListener -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $actionsRunnerRoot 'bin\Runner.Listener.exe') -PathType Leaf)) {
   Write-Output 'copying preinstalled GitHub Actions runner'
   Copy-Item -Path (Join-Path $actionsRunnerRoot '*') -Destination $workdir -Recurse -Force
 }
@@ -124,13 +126,28 @@ if ($runnerApplicationsManifest) {
     $runnerUpdateCandidate = Join-Path $runnerUpdateRoot 'candidate'
     $runnerPreviousWorkdir = Join-Path $runnerUpdateRoot 'previous'
     $keepRunnerUpdateRoot = $false
+    # none, previous-moved, or committed. The finally block restores the
+    # previous Runner unless the cutover committed.
+    $runnerCutoverState = 'none'
     New-Item -ItemType Directory -Force -Path $runnerUpdateCandidate | Out-Null
     try {
       Write-Output "downloading GitHub Actions runner $runnerTargetVersion for $runnerArchitecture"
-      # curl.exe ships with Windows 11 and bounds the transfer size and time.
-      & curl.exe --fail --location --silent --show-error --retry 3 --retry-delay 1 --retry-max-time 300 --connect-timeout 10 --max-time 300 --max-filesize 536870912 --output $runnerUpdateArchive $runnerDownloadURL
-      if ($LASTEXITCODE -ne 0) {
-        Fail 'GitHub Actions runner download failed'
+      # curl.exe ships with Windows 11. Each attempt gets only the time left in
+      # one five-minute total deadline, so retries cannot extend it.
+      $runnerDownloadDeadline = [DateTime]::UtcNow.AddSeconds(300)
+      for ($attempt = 1; ; $attempt++) {
+        $remainingSeconds = [int][Math]::Floor(($runnerDownloadDeadline - [DateTime]::UtcNow).TotalSeconds)
+        if ($remainingSeconds -le 0) {
+          Fail 'GitHub Actions runner download exceeded 300 seconds'
+        }
+        & curl.exe --fail --location --silent --show-error --connect-timeout ([Math]::Min(10, $remainingSeconds)) --max-time $remainingSeconds --max-filesize 536870912 --output $runnerUpdateArchive $runnerDownloadURL
+        if ($LASTEXITCODE -eq 0) {
+          break
+        }
+        if ($attempt -ge 4) {
+          Fail 'GitHub Actions runner download failed'
+        }
+        Start-Sleep -Seconds 1
       }
       $archiveChecksum = (Get-FileHash -LiteralPath $runnerUpdateArchive -Algorithm SHA256).Hash.ToLowerInvariant()
       if ($archiveChecksum -ne $runnerSHA256Checksum) {
@@ -153,21 +170,26 @@ if ($runnerApplicationsManifest) {
       } catch {
         Fail 'GitHub Actions runner work directory replacement failed'
       }
+      $runnerCutoverState = 'previous-moved'
       try {
         Move-Item -LiteralPath $runnerUpdateCandidate -Destination $workdir
       } catch {
+        Fail 'GitHub Actions runner work directory replacement failed'
+      }
+      $runnerCutoverState = 'committed'
+      $previousRunnerLabel = if ($currentRunnerVersion) { $currentRunnerVersion } else { 'unknown' }
+      Write-Output "updated GitHub Actions runner from $previousRunnerLabel to $runnerTargetVersion"
+    } finally {
+      # This also runs when the script is stopped or exits between the two moves.
+      if ($runnerCutoverState -eq 'previous-moved') {
         try {
-          Move-Item -LiteralPath $runnerPreviousWorkdir -Destination $workdir
+          Move-Item -LiteralPath $runnerPreviousWorkdir -Destination $workdir -ErrorAction Stop
         } catch {
           # The previous Runner is the last recoverable copy. Keep the update root.
           $keepRunnerUpdateRoot = $true
           [Console]::Error.WriteLine("GitHub Actions runner work directory rollback failed: $runnerPreviousWorkdir")
         }
-        Fail 'GitHub Actions runner work directory replacement failed'
       }
-      $previousRunnerLabel = if ($currentRunnerVersion) { $currentRunnerVersion } else { 'unknown' }
-      Write-Output "updated GitHub Actions runner from $previousRunnerLabel to $runnerTargetVersion"
-    } finally {
       if (-not $keepRunnerUpdateRoot) {
         Remove-Item -LiteralPath $runnerUpdateRoot -Recurse -Force -ErrorAction SilentlyContinue
       }
@@ -176,8 +198,8 @@ if ($runnerApplicationsManifest) {
   }
 }
 
-if (-not (Test-Path -LiteralPath $runnerConfig -PathType Leaf)) {
-  [Console]::Error.WriteLine("missing GitHub Actions runner at $actionsRunnerRoot\config.cmd")
+if (-not (Test-Path -LiteralPath $runnerListener -PathType Leaf)) {
+  [Console]::Error.WriteLine("missing GitHub Actions runner at $actionsRunnerRoot\bin\Runner.Listener.exe")
   Fail 'use a Windows runner template with a preinstalled runner, or a private spec that resolves runner downloads'
 }
 
@@ -245,7 +267,7 @@ if ($cacheS3Bucket -and $cacheS3AccessKey -and $cacheS3SecretKey) {
 $env:RUNNERD_SANDBOX_ID = $sandboxID
 $env:RUNNERD_REQUEST_ID = $runnerRequestID
 $env:RUNNERD_RUNNER_NAME = $runnerName
-$env:RUNNERD_RUNNER_LISTENER = Join-Path $workdir 'bin\Runner.Listener.exe'
+$env:RUNNERD_RUNNER_LISTENER = $runnerListener
 
 # Windows has no FIFO. The job-started hook atomically publishes a marker file
 # that this script relays to its own stdout, where runnerd observes it.
@@ -267,6 +289,14 @@ if ($env:RUNNERD_HOOK_SIGNAL_FALLBACK_PATH) {
   $temporary = "$($env:RUNNERD_HOOK_SIGNAL_FALLBACK_PATH).tmp"
   [IO.File]::WriteAllText($temporary, $signal)
   Move-Item -LiteralPath $temporary -Destination $env:RUNNERD_HOOK_SIGNAL_FALLBACK_PATH -Force
+  # Workflow steps run as this user after the hook returns. Wait until the
+  # outer script consumes the marker so a step cannot replace it first; on
+  # timeout, drop it so no version is recorded instead of a forged one.
+  $deadline = [DateTime]::UtcNow.AddSeconds(10)
+  while ((Test-Path -LiteralPath $env:RUNNERD_HOOK_SIGNAL_FALLBACK_PATH) -and [DateTime]::UtcNow -lt $deadline) {
+    Start-Sleep -Milliseconds 50
+  }
+  Remove-Item -LiteralPath $env:RUNNERD_HOOK_SIGNAL_FALLBACK_PATH -Force -ErrorAction SilentlyContinue
 }
 Write-Output "::notice title=Qiniu sandbox::sandbox_id=$($env:RUNNERD_SANDBOX_ID) runner_request_id=$($env:RUNNERD_REQUEST_ID) runner_name=$($env:RUNNERD_RUNNER_NAME)"
 Write-Output "Qiniu sandbox id: $($env:RUNNERD_SANDBOX_ID)"
@@ -287,7 +317,7 @@ if ($runnerGroup) {
 Write-Output "configuring GitHub Actions runner $runnerName"
 $retriesLeft = 10
 while ($true) {
-  & $runnerConfig @configArguments
+  & $runnerListener configure @configArguments
   if ($LASTEXITCODE -eq 0) {
     break
   }
@@ -310,10 +340,16 @@ try {
   $hookSignalRelayed = $false
   while (-not $runner.HasExited) {
     if (-not $hookSignalRelayed -and (Test-Path -LiteralPath $hookSignalPath -PathType Leaf)) {
-      [Console]::Out.Write([IO.File]::ReadAllText($hookSignalPath))
-      [Console]::Out.Flush()
-      Remove-Item -LiteralPath $hookSignalPath -Force -ErrorAction SilentlyContinue
+      # Relay at most one marker. Removing the file acknowledges it to the hook.
       $hookSignalRelayed = $true
+      try {
+        $hookSignal = [IO.File]::ReadAllText($hookSignalPath)
+        Remove-Item -LiteralPath $hookSignalPath -Force -ErrorAction SilentlyContinue
+        [Console]::Out.Write($hookSignal)
+        [Console]::Out.Flush()
+      } catch {
+        # The hook timed out and removed the marker first.
+      }
     }
     Start-Sleep -Milliseconds 100
   }
@@ -321,6 +357,6 @@ try {
   $runnerExitCode = $runner.ExitCode
 } finally {
   Remove-Item -LiteralPath $hookSignalPath, "$hookSignalPath.tmp" -Force -ErrorAction SilentlyContinue
-  & $runnerConfig remove --token $registrationToken
+  & $runnerListener remove --token $registrationToken
 }
 exit $runnerExitCode

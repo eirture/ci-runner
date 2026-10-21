@@ -257,6 +257,7 @@ var (
 	ErrTemplateStateUnavailable     = errors.New("template default build state cannot be confirmed")
 	ErrSandboxNotFound              = errors.New("sandbox not found")
 	ErrRunnerNotFound               = errors.New("runner process not found")
+	ErrRunnerApplicationMissing     = errors.New("github runner applications contain no application")
 	ErrNetworkDiagnosticTarget      = errors.New("unsupported network diagnostic target")
 	ErrNetworkDiagnosticExecution   = errors.New("network diagnostic command failed")
 	ErrNetworkDiagnosticOutputLimit = errors.New("network diagnostic output limit exceeded")
@@ -285,7 +286,7 @@ const (
 		`$f='C:\ProgramData\qiniu-runner\image.env';` +
 		`if(-not $t -and (Test-Path -LiteralPath $f)){foreach($l in Get-Content -LiteralPath $f){if($l -match '^(IMAGE_VERSION|ImageVersion)=(.*)$'){$t=$Matches[2].Trim().Trim([char]34).Trim([char]39);break}}};` +
 		`$r='';` +
-		`foreach($d in 'C:\runner\actions-runner','C:\actions-runner'){$x=Join-Path $d 'bin\Runner.Listener.exe';if(Test-Path -LiteralPath $x){$r=((& $x --version) | Out-String).Trim();break}};` +
+		`$x='C:\actions-runner\bin\Runner.Listener.exe';if(Test-Path -LiteralPath $x){$r=((& $x --version) | Out-String).Trim()};` +
 		`if($t.Length -gt 256){$t=''};if($r.Length -gt 256){$r=''};` +
 		`$e=[Text.Encoding]::UTF8;` +
 		`'template_version='+[Convert]::ToBase64String($e.GetBytes([string]$t));` +
@@ -586,6 +587,11 @@ func sandboxAlias(alias *string) string {
 }
 
 func (s *E2BService) StartRunner(ctx context.Context, input StartInput) (StartResult, error) {
+	// An empty manifest skips preflight, so resolved applications without one
+	// for this platform must fail before a Sandbox exists.
+	if len(input.RunnerApplications) > 0 && !HasRunnerApplication(input.Platform, input.RunnerApplications) {
+		return StartResult{}, fmt.Errorf("%w for platform %s", ErrRunnerApplicationMissing, input.Platform.runnerApplicationOS())
+	}
 	timeout := sandboxTimeoutSeconds(input.Timeout)
 	allowInternet := true
 	metadata := qnsandbox.Metadata{
@@ -799,16 +805,15 @@ func (c *effectiveRunnerVersionCapture) Version() string {
 }
 
 func readRuntimeEnvironment(ctx context.Context, sb *qnsandbox.Sandbox, platform Platform) runtimeEnvironment {
-	command, timeout := runtimeEnvironmentCommand, runtimeEnvironmentTimeout
+	command := runtimeEnvironmentCommand
 	if platform == PlatformWindows {
-		// Windows PowerShell startup alone can take a few seconds.
-		command, timeout = windowsRuntimeEnvironmentCommand, 4*runtimeEnvironmentTimeout
+		command = windowsRuntimeEnvironmentCommand
 	}
 	result, err := sb.Commands().Run(
 		ctx,
 		command,
 		qnsandbox.WithCommandUser(platform.bootstrapUser()),
-		qnsandbox.WithTimeout(timeout),
+		qnsandbox.WithTimeout(runtimeEnvironmentTimeout),
 	)
 	if err != nil || result == nil || result.ExitCode != 0 {
 		return runtimeEnvironment{}
@@ -1240,6 +1245,12 @@ func renderStartScript(template string, input StartInput, sandboxID string) stri
 		base64.StdEncoding.EncodeToString([]byte(input.CacheS3SessionToken)),
 		base64.StdEncoding.EncodeToString([]byte(runnerApplicationsManifest(input.Platform, input.RunnerApplications))),
 	)
+}
+
+// HasRunnerApplication reports whether applications include a valid
+// descriptor for platform.
+func HasRunnerApplication(platform Platform, applications []RunnerApplication) bool {
+	return runnerApplicationsManifest(platform, applications) != ""
 }
 
 func runnerApplicationsManifest(platform Platform, applications []RunnerApplication) string {

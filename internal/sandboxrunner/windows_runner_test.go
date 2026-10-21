@@ -1,7 +1,9 @@
 package sandboxrunner
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -110,13 +112,99 @@ func TestWindowsStartScriptUsesEphemeralRunnerAndHooks(t *testing.T) {
 		"$env:ACTIONS_RUNNER_HOOK_JOB_COMPLETED = Join-Path $hookRoot 'job-completed.ps1'",
 		`RUNNERD_EFFECTIVE_RUNNER_VERSION=`,
 		`RUNNERD_JOB_STARTED`,
-		"& $runnerConfig remove --token $registrationToken",
+		"& $runnerListener configure @configArguments",
+		"& $runnerListener remove --token $registrationToken",
 		"Get-FileHash -LiteralPath $runnerUpdateArchive -Algorithm SHA256",
 		"--max-filesize 536870912",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script does not contain %q", want)
 		}
+	}
+	// cmd.exe would reparse values such as a Runner Group named R&D.
+	if strings.Contains(script, "'config.cmd'") || strings.Contains(script, "$runnerConfig") {
+		t.Fatal("script passes registration arguments through a batch file")
+	}
+}
+
+func TestWindowsStartScriptBoundsRunnerDownloadAcrossRetries(t *testing.T) {
+	t.Parallel()
+	script := windowsStartScript(StartInput{Platform: PlatformWindows}, "sandbox-1")
+	for _, want := range []string{
+		"$runnerDownloadDeadline = [DateTime]::UtcNow.AddSeconds(300)",
+		"--max-time $remainingSeconds",
+		"if ($remainingSeconds -le 0) {",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script does not contain %q", want)
+		}
+	}
+	if strings.Contains(script, "--retry") || strings.Contains(script, "--max-time 300") {
+		t.Fatal("curl retries or per-attempt limits can extend the total download deadline")
+	}
+}
+
+func TestWindowsStartScriptRestoresPreviousRunnerFromFinally(t *testing.T) {
+	t.Parallel()
+	script := windowsStartScript(StartInput{Platform: PlatformWindows}, "sandbox-1")
+	finally := script[strings.Index(script, "} finally {\n      # This also runs"):]
+	finally = finally[:strings.Index(finally, "Set-Location -LiteralPath $workdir")]
+	for _, want := range []string{
+		"if ($runnerCutoverState -eq 'previous-moved') {",
+		"Move-Item -LiteralPath $runnerPreviousWorkdir -Destination $workdir -ErrorAction Stop",
+		"$keepRunnerUpdateRoot = $true",
+		"if (-not $keepRunnerUpdateRoot) {",
+	} {
+		if !strings.Contains(finally, want) {
+			t.Fatalf("cutover finally block does not contain %q:\n%s", want, finally)
+		}
+	}
+	if strings.Index(script, "$runnerCutoverState = 'previous-moved'") > strings.Index(script, "Move-Item -LiteralPath $runnerUpdateCandidate -Destination $workdir") {
+		t.Fatal("cutover state is recorded after the candidate move")
+	}
+}
+
+func TestWindowsJobStartedHookWaitsForMarkerConsumption(t *testing.T) {
+	t.Parallel()
+	script := windowsStartScript(StartInput{Platform: PlatformWindows}, "sandbox-1")
+	hook := script[strings.Index(script, "job-started.ps1') -Encoding ASCII -Value @'"):]
+	hook = hook[:strings.Index(hook, "\n'@")]
+	publish := strings.Index(hook, "Move-Item -LiteralPath $temporary")
+	wait := strings.Index(hook, "while ((Test-Path -LiteralPath $env:RUNNERD_HOOK_SIGNAL_FALLBACK_PATH)")
+	drop := strings.Index(hook, "Remove-Item -LiteralPath $env:RUNNERD_HOOK_SIGNAL_FALLBACK_PATH")
+	if publish < 0 || wait < publish || drop < wait {
+		t.Fatalf("hook does not wait for consumption and drop an unconsumed marker:\n%s", hook)
+	}
+	relay := script[strings.Index(script, "if (-not $hookSignalRelayed"):]
+	if strings.Index(relay, "$hookSignalRelayed = $true") > strings.Index(relay, "ReadAllText($hookSignalPath)") {
+		t.Fatal("relay can forward more than one marker")
+	}
+}
+
+func TestHasRunnerApplicationRequiresSelectedPlatform(t *testing.T) {
+	t.Parallel()
+	linux := RunnerApplication{
+		Architecture:   "x64",
+		Version:        "2.337.0",
+		DownloadURL:    "https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz",
+		SHA256Checksum: "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613",
+	}
+	if !HasRunnerApplication(PlatformLinux, []RunnerApplication{linux}) {
+		t.Fatal("Linux application is not accepted for Linux")
+	}
+	if HasRunnerApplication(PlatformWindows, []RunnerApplication{linux}) {
+		t.Fatal("Linux-only applications are accepted for Windows")
+	}
+	if _, err := (&E2BService{}).StartRunner(context.Background(), StartInput{Platform: PlatformWindows, RunnerApplications: []RunnerApplication{linux}}); !errors.Is(err, ErrRunnerApplicationMissing) {
+		t.Fatalf("StartRunner error = %v, want ErrRunnerApplicationMissing", err)
+	}
+}
+
+func TestWindowsRuntimeEnvironmentProbesPreinstalledRunnerOnly(t *testing.T) {
+	t.Parallel()
+	if strings.Contains(windowsRuntimeEnvironmentCommand, `C:\runner\actions-runner`) ||
+		!strings.Contains(windowsRuntimeEnvironmentCommand, `$x='C:\actions-runner\bin\Runner.Listener.exe'`) {
+		t.Fatalf("Windows probe must read only the preinstalled Runner: %s", windowsRuntimeEnvironmentCommand)
 	}
 }
 
@@ -227,24 +315,26 @@ echo 'Status: ready'
 	}
 }
 
+// readTemplatePin returns a KEY=VALUE pin from a tracked template file.
+func readTemplatePin(t *testing.T, path, key string) string {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(repositoryRoot(t), path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.SplitSeq(string(content), "\n") {
+		if value, ok := strings.CutPrefix(line, key+"="); ok {
+			return value
+		}
+	}
+	t.Fatalf("%s has no %s", path, key)
+	return ""
+}
+
 func TestWindowsTemplateRunnerPinMatchesCommonPin(t *testing.T) {
 	t.Parallel()
-	read := func(path, key string) string {
-		t.Helper()
-		content, err := os.ReadFile(filepath.Join(repositoryRoot(t), path))
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, line := range strings.Split(string(content), "\n") {
-			if value, ok := strings.CutPrefix(line, key+"="); ok {
-				return value
-			}
-		}
-		t.Fatalf("%s has no %s", path, key)
-		return ""
-	}
-	common := read("templates/common/actions-runner.env", "RUNNER_VERSION")
-	windows := read("templates/github-runner-windows-11/template.env", "RUNNER_WIN_X64_VERSION")
+	common := readTemplatePin(t, "templates/common/actions-runner.env", "RUNNER_VERSION")
+	windows := readTemplatePin(t, "templates/github-runner-windows-11/template.env", "RUNNER_WIN_X64_VERSION")
 	if windows != common {
 		t.Fatalf("Windows runner pin %s does not match common pin %s; update template.env with the win-x64 archive digest and size", windows, common)
 	}

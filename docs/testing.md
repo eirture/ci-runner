@@ -740,7 +740,10 @@ Windows Sandbox. It is skipped unless `RUNNERD_WINDOWS_E2E=1`, and needs
 `RUNNERD_E2E_REPOSITORY_URL`, and a fresh `RUNNERD_E2E_REGISTRATION_TOKEN`.
 Optionally set `RUNNERD_E2E_TEMPLATE_VERSION`, `RUNNERD_E2E_LABELS`, and a
 `RUNNERD_E2E_TRIGGER_CMD` bash command that queues one matching job after the
-Runner starts listening; otherwise trigger the job manually.
+Runner starts listening; otherwise trigger the job manually. The test reads the
+expected template Runner version and archive digest from
+`templates/github-runner-windows-11/template.env`, and accepts a newer effective
+version after GitHub's official self-update.
 
 ```bash
 RUNNERD_WINDOWS_E2E=1 go test -tags development ./internal/sandboxrunner -run TestWindowsRunnerE2E -v -timeout 25m

@@ -424,6 +424,46 @@ func TestStartRunnerCustomRunnerApplicationsFailsBeforeRegistration(t *testing.T
 	}
 }
 
+func TestStartRunnerCustomRunnerApplicationsRequireSelectedPlatform(t *testing.T) {
+	// GitHub returns valid Linux descriptors only; a Windows request must not
+	// fall back to skipping preflight.
+	const applicationsResponse = `[{"os":"linux","architecture":"x64","download_url":"https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz","filename":"actions-runner-linux-x64-2.337.0.tar.gz","sha256_checksum":"70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"}]`
+	var tokenCalls int
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners/downloads":
+			_, _ = w.Write([]byte(applicationsResponse))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/actions/runners/registration-token":
+			tokenCalls++
+			http.Error(w, "token must not be requested", http.StatusInternalServerError)
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	upsertLifecycleProfile(t, store, state.RunnerProfile{
+		Name: "windows", Labels: []string{"self-hosted", "windows"}, TemplateID: "custom-template-id", MaxConcurrency: 10, Enabled: true,
+	})
+	sandbox := &lifecycleSandboxService{}
+	srv := newRunnerLifecycleTestServer(t, store, ghServer.URL, sandbox)
+	createLifecycleRequest(t, store, "custom-windows-applications", "windows", 987)
+
+	srv.startRunner(context.Background(), "custom-windows-applications", "worker-test")
+	got, err := store.ReadState("custom-windows-applications")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FailureStage != "github_runner_downloads" {
+		t.Fatalf("state = %#v, want github_runner_downloads failure", got)
+	}
+	if tokenCalls != 0 || len(sandbox.startInputs()) != 0 {
+		t.Fatalf("token calls=%d StartRunner inputs=%#v, want neither", tokenCalls, sandbox.startInputs())
+	}
+}
+
 func TestRunnerLifecycleRevalidatesGlobalProfileBeforeStarting(t *testing.T) {
 	store := state.New(t.TempDir())
 	profile := lifecycleManagedProfile("managed-template-id")

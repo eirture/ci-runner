@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -43,6 +44,12 @@ func TestWindowsRunnerE2E(t *testing.T) {
 	repositoryURL := required("RUNNERD_E2E_REPOSITORY_URL")
 	registrationToken := required("RUNNERD_E2E_REGISTRATION_TOKEN")
 	labels := "self-hosted,windows,x64,qiniu,windows-11"
+	// The template's preinstalled baseline is the tracked Windows pin. GitHub
+	// may officially update the Runner before the job, so the effective
+	// version only has to reach that baseline.
+	const windowsPins = "templates/github-runner-windows-11/template.env"
+	baselineVersion := readTemplatePin(t, windowsPins, "RUNNER_WIN_X64_VERSION")
+	baselineSHA256 := readTemplatePin(t, windowsPins, "RUNNER_WIN_X64_ARCHIVE_SHA256")
 	if value := strings.TrimSpace(os.Getenv("RUNNERD_E2E_LABELS")); value != "" {
 		labels = value
 	}
@@ -70,9 +77,9 @@ func TestWindowsRunnerE2E(t *testing.T) {
 		RunnerApplications: []RunnerApplication{{
 			OS:             "win",
 			Architecture:   "x64",
-			Version:        "2.337.0",
-			DownloadURL:    "https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-win-x64-2.337.0.zip",
-			SHA256Checksum: "1150692afa94e71f872017e254ea55b6eece1eece3fe7e3a6d4c93d0a1b85cfc",
+			Version:        baselineVersion,
+			DownloadURL:    "https://github.com/actions/runner/releases/download/v" + baselineVersion + "/actions-runner-win-x64-" + baselineVersion + ".zip",
+			SHA256Checksum: baselineSHA256,
 		}},
 		TemplateID:     templateID,
 		Timeout:        30 * time.Minute,
@@ -115,8 +122,8 @@ func TestWindowsRunnerE2E(t *testing.T) {
 	if result.PID == 0 {
 		t.Fatal("StartRunner returned no PID")
 	}
-	if result.RunnerVersion != "2.337.0" {
-		t.Fatalf("runtime runner version = %q, want 2.337.0", result.RunnerVersion)
+	if result.RunnerVersion != baselineVersion {
+		t.Fatalf("runtime runner version = %q, want template baseline %s", result.RunnerVersion, baselineVersion)
 	}
 	if want := strings.TrimSpace(os.Getenv("RUNNERD_E2E_TEMPLATE_VERSION")); want != "" && result.TemplateVersion != want {
 		t.Fatalf("runtime template version = %q, want %q", result.TemplateVersion, want)
@@ -165,11 +172,11 @@ func TestWindowsRunnerE2E(t *testing.T) {
 	if runnerResult.ExitCode != 0 {
 		t.Fatalf("runner exit code = %d, error=%q", runnerResult.ExitCode, runnerResult.Error)
 	}
-	if runnerResult.EffectiveRunnerVersion != "2.337.0" {
-		t.Fatalf("effective runner version = %q, want 2.337.0", runnerResult.EffectiveRunnerVersion)
+	if !runnerVersionAtLeast(runnerResult.EffectiveRunnerVersion, baselineVersion) {
+		t.Fatalf("effective runner version = %q, want at least %s", runnerResult.EffectiveRunnerVersion, baselineVersion)
 	}
 	for _, want := range []string{
-		"GitHub Actions runner 2.337.0 is already installed",
+		"GitHub Actions runner " + baselineVersion + " is already installed",
 		runnerJobStartedMarker,
 		"completed with result: Succeeded",
 	} {
@@ -177,4 +184,35 @@ func TestWindowsRunnerE2E(t *testing.T) {
 			t.Fatalf("runner stdout does not contain %q", want)
 		}
 	}
+}
+
+// runnerVersionAtLeast compares the numeric major.minor.patch prefix.
+func runnerVersionAtLeast(version, baseline string) bool {
+	parse := func(value string) ([3]int, bool) {
+		var parts [3]int
+		fields := strings.SplitN(value, ".", 3)
+		if len(fields) != 3 {
+			return parts, false
+		}
+		fields[2], _, _ = strings.Cut(fields[2], "-")
+		for i, field := range fields {
+			number, err := strconv.Atoi(field)
+			if err != nil {
+				return parts, false
+			}
+			parts[i] = number
+		}
+		return parts, true
+	}
+	got, ok := parse(version)
+	want, wantOK := parse(baseline)
+	if !ok || !wantOK {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return got[i] > want[i]
+		}
+	}
+	return true
 }

@@ -492,6 +492,11 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 			s.failStart(id, st, "github_runner_downloads", err)
 			return
 		}
+		platform := sandboxrunner.PlatformForLabels(req.Labels)
+		if !sandboxrunner.HasRunnerApplication(platform, applications) {
+			s.failStart(id, st, "github_runner_downloads", fmt.Errorf("%w for the %s platform", sandboxrunner.ErrRunnerApplicationMissing, platform))
+			return
+		}
 		runnerApplications = append([]sandboxrunner.RunnerApplication(nil), applications...)
 	}
 

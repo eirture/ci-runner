@@ -722,7 +722,8 @@ apt 管理的 `packaging` 保持不变、pipx 工具目录兼容、普通用户�
 `RUNNERD_E2E_TEMPLATE_ID`、`RUNNERD_E2E_REPOSITORY_URL` 和新生成的
 `RUNNERD_E2E_REGISTRATION_TOKEN`。可选设置 `RUNNERD_E2E_TEMPLATE_VERSION`、
 `RUNNERD_E2E_LABELS`，以及一条 bash 命令 `RUNNERD_E2E_TRIGGER_CMD`：Runner 开始监听后由它触发一个匹配的
-job；不设置时请手动触发。
+job；不设置时请手动触发。测试从 `templates/github-runner-windows-11/template.env` 读取模板 Runner
+的预期版本和压缩包摘要；GitHub 官方自升级后，实际运行版本更高也视为通过。
 
 ```bash
 RUNNERD_WINDOWS_E2E=1 go test -tags development ./internal/sandboxrunner -run TestWindowsRunnerE2E -v -timeout 25m
