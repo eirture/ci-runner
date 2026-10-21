@@ -1256,6 +1256,9 @@ func HasRunnerApplication(platform Platform, applications []RunnerApplication) b
 }
 
 func runnerApplicationsManifest(platform Platform, applications []RunnerApplication) string {
+	// Bounds the manifest per platform. It must stay at least the largest
+	// number of architectures runnerapplication supports for one OS (Linux
+	// x64, arm64 and arm), or a supported descriptor is silently dropped.
 	const maxApplications = 3
 	lines := make([]string, 0, min(len(applications), maxApplications))
 	for _, application := range applications {

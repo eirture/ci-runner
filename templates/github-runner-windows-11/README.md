@@ -14,8 +14,8 @@ backslashes. qshell always prepends `USER root` and `WORKDIR /`, and appends
 `USER user` and `WORKDIR /home/user` unless the Dockerfile sets its own. The
 Windows builder ignores `USER` and runs `RUN` steps through `cmd.exe` as the
 console user, so the explicit `USER user` and `WORKDIR C:\runner` only replace
-those Linux defaults. It copies
-`scripts/setup-template.ps1` and `template.env` into `C:\qiniu-build`, runs the
+those Linux defaults. It copies `scripts/setup-template.ps1` into
+`C:\qiniu-build` and `template.env` to `C:\qiniu-build\build.env`, runs the
 script with Windows PowerShell 5.1, then removes the directory. Every download
 is pinned by URL, size, and SHA-256. The script installs:
 

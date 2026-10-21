@@ -92,6 +92,11 @@ if (-not (Test-Path -LiteralPath $runnerListener -PathType Leaf) -and (Test-Path
   Copy-Item -Path (Join-Path $actionsRunnerRoot '*') -Destination $workdir -Recurse -Force
 }
 
+# Fail before any preflight download when the spec cannot run here.
+if ('%[8]s' -eq '1') {
+  Fail 'Docker daemon is required for this managed runner but Windows runners do not provide Docker'
+}
+
 $runnerApplicationsManifest = Decode-Argument '%[17]s'
 if ($runnerApplicationsManifest) {
   $runnerArchitecture = switch ($env:PROCESSOR_ARCHITECTURE) {
@@ -129,6 +134,21 @@ if ($runnerApplicationsManifest) {
     # none, previous-moved, or committed. The finally block restores the
     # previous Runner unless the cutover committed.
     $runnerCutoverState = 'none'
+    # Older curl cannot apply --max-filesize when the response has no
+    # Content-Length, and Windows has no ulimit equivalent; curl 8.4.0 and
+    # newer also stop a transfer once it exceeds the limit.
+    $curlVersion = ''
+    try {
+      $curlBanner = ((& curl.exe --version 2>$null) | Select-Object -First 1)
+      if ($curlBanner -match '^curl ([0-9]+\.[0-9]+\.[0-9]+)') {
+        $curlVersion = $Matches[1]
+      }
+    } catch {
+    }
+    if (-not (Test-RunnerVersionAtLeast $curlVersion '8.4.0')) {
+      $observedCurlVersion = if ($curlVersion) { $curlVersion } else { 'unknown' }
+      Fail "GitHub Actions runner preflight update requires curl.exe 8.4.0 or newer; found $observedCurlVersion"
+    }
     New-Item -ItemType Directory -Force -Path $runnerUpdateCandidate | Out-Null
     try {
       Write-Output "downloading GitHub Actions runner $runnerTargetVersion for $runnerArchitecture"
@@ -203,9 +223,6 @@ if (-not (Test-Path -LiteralPath $runnerListener -PathType Leaf)) {
   Fail 'use a Windows runner template with a preinstalled runner, or a private spec that resolves runner downloads'
 }
 
-if ('%[8]s' -eq '1') {
-  Fail 'Docker daemon is required for this managed runner but Windows runners do not provide Docker'
-}
 
 $runnerURL = Decode-Argument '%[1]s'
 $registrationToken = Decode-Argument '%[2]s'

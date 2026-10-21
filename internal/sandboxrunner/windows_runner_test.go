@@ -144,6 +144,26 @@ func TestWindowsStartScriptBoundsRunnerDownloadAcrossRetries(t *testing.T) {
 	}
 }
 
+func TestWindowsStartScriptRequiresCurlThatBoundsUnknownSizes(t *testing.T) {
+	t.Parallel()
+	script := windowsStartScript(StartInput{Platform: PlatformWindows}, "sandbox-1")
+	guard := strings.Index(script, "if (-not (Test-RunnerVersionAtLeast $curlVersion '8.4.0')) {")
+	download := strings.Index(script, "& curl.exe --fail")
+	if guard < 0 || download < guard {
+		t.Fatal("preflight download does not require curl 8.4.0 or newer first")
+	}
+}
+
+func TestWindowsStartScriptChecksDockerBeforePreflight(t *testing.T) {
+	t.Parallel()
+	script := windowsStartScript(StartInput{Platform: PlatformWindows, RequireDocker: true}, "sandbox-1")
+	docker := strings.Index(script, "if ('1' -eq '1') {")
+	manifest := strings.Index(script, "$runnerApplicationsManifest = Decode-Argument")
+	if docker < 0 || manifest < docker {
+		t.Fatal("Docker requirement is checked after the preflight update")
+	}
+}
+
 func TestWindowsStartScriptToleratesRunnerRemovalFailure(t *testing.T) {
 	t.Parallel()
 	script := windowsStartScript(StartInput{Platform: PlatformWindows}, "sandbox-1")
