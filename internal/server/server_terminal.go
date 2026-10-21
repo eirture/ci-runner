@@ -498,6 +498,10 @@ func (s *Server) handleUserCreateRunnerTerminal(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
+	_, account, ok := s.requireUserSession(w, r)
+	if !ok {
+		return
+	}
 	if !runnerTerminalAvailable(st) {
 		writeError(w, http.StatusConflict, "terminal is only available while a sandbox job is active")
 		return
@@ -548,11 +552,48 @@ func (s *Server) handleUserCreateRunnerTerminal(w http.ResponseWriter, r *http.R
 	}
 	pending = nil
 	sessionMu.Unlock()
+	go s.watchRunnerTerminal(terminalCtx, st, account.ID, session.id)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"session_id": session.id,
 		"pid":        terminal.PID(),
 		"sandbox_id": st.SandboxID,
 	})
+}
+
+func (s *Server) watchRunnerTerminal(ctx context.Context, expected state.RunnerState, accountID int64, sessionID string) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = s.terminals.CloseSession(closeCtx, sessionID)
+	}()
+	nextAccessCheck := time.Now().Add(30 * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, ok := s.terminals.Get(sessionID); !ok {
+				return
+			}
+			current, err := s.store.ReadState(expected.ID)
+			if err != nil || !runnerTerminalAvailable(current) || current.SandboxID != expected.SandboxID ||
+				current.GitHubInstallationID != expected.GitHubInstallationID || current.RepositoryFullName != expected.RepositoryFullName {
+				return
+			}
+			if time.Now().Before(nextAccessCheck) {
+				continue
+			}
+			checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			access, err := s.userAuthorizedRepositoryAccess(checkCtx, accountID)
+			cancel()
+			if err != nil || !hasRepositoryAccess(access, current.GitHubInstallationID, current.RepositoryFullName) {
+				return
+			}
+			nextAccessCheck = time.Now().Add(30 * time.Second)
+		}
+	}
 }
 
 func (s *Server) handleUserRunnerTerminalEvents(w http.ResponseWriter, r *http.Request) {
@@ -569,6 +610,15 @@ func (s *Server) handleUserRunnerTerminalEvents(w http.ResponseWriter, r *http.R
 
 func (s *Server) streamTerminalSession(w http.ResponseWriter, r *http.Request, session *terminalSession) {
 	controller := http.NewResponseController(w)
+	// HTTP Server.WriteTimeout is absolute, even while a stream is active.
+	// Renew it for each write, while still bounding a blocked browser connection.
+	prepareWrite := func() bool {
+		err := controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		return err == nil || errors.Is(err, http.ErrNotSupported)
+	}
+	if !prepareWrite() {
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -582,17 +632,37 @@ func (s *Server) streamTerminalSession(w http.ResponseWriter, r *http.Request, s
 		s.terminals.CloseSessionWhenIdle(session.id, terminalIdleCloseDelay)
 	}()
 	if len(initial) > 0 {
+		if !prepareWrite() {
+			return
+		}
 		writeTerminalEvent(w, initial)
 		if err := controller.Flush(); err != nil {
 			return
 		}
 	}
+	// An idle shell has no output. Keep proxies from timing out its SSE stream;
+	// comments do not enter the terminal output or extend the Sandbox lifetime.
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-heartbeat.C:
+			if !prepareWrite() {
+				return
+			}
+			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			if err := controller.Flush(); err != nil {
+				return
+			}
 		case data, ok := <-ch:
 			if !ok {
+				return
+			}
+			if !prepareWrite() {
 				return
 			}
 			writeTerminalEvent(w, data)
