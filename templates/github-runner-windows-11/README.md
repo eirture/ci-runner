@@ -1,6 +1,6 @@
 # GitHub runner Windows 11 template
 
-This 4-vCPU, 8192-MiB Windows 11 x64 template is built with qshell on top of
+This 8-vCPU, 8192-MiB Windows 11 x64 template is built with qshell on top of
 the provider's `windows11` template. Windows Sandbox templates cannot start from
 a Docker image, so `qshell.sandbox.toml` sets `from_template = "windows11"` and
 qshell ignores the Dockerfile `FROM` line. The template keeps the base

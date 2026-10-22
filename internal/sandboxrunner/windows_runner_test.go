@@ -242,8 +242,66 @@ func TestHasRunnerApplicationRequiresSelectedPlatform(t *testing.T) {
 func TestWindowsRuntimeEnvironmentProbesPreinstalledRunnerOnly(t *testing.T) {
 	t.Parallel()
 	if strings.Contains(windowsRuntimeEnvironmentCommand, `C:\runner\actions-runner`) ||
-		!strings.Contains(windowsRuntimeEnvironmentCommand, `$x='C:\actions-runner\bin\Runner.Listener.exe'`) {
+		!strings.Contains(windowsRuntimeEnvironmentCommand, `if exist C:\actions-runner\bin\Runner.Listener.exe C:\actions-runner\bin\Runner.Listener.exe --version`) {
 		t.Fatalf("Windows probe must read only the preinstalled Runner: %s", windowsRuntimeEnvironmentCommand)
+	}
+}
+
+func TestWindowsRuntimeEnvironmentCommandAvoidsPowerShellAndFullEnvironment(t *testing.T) {
+	t.Parallel()
+	command := strings.ToLower(windowsRuntimeEnvironmentCommand)
+	// PowerShell startup can exceed the probe budget, and the probe must never
+	// print the whole image.env or process environment.
+	for _, forbidden := range []string{"powershell", "pwsh", "type ", "set ", "%"} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("Windows probe contains %q: %s", forbidden, windowsRuntimeEnvironmentCommand)
+		}
+	}
+	if !strings.Contains(windowsRuntimeEnvironmentCommand, `findstr /b /c:"IMAGE_VERSION=" /c:"ImageVersion="`) ||
+		!strings.HasSuffix(windowsRuntimeEnvironmentCommand, " & exit /b 0") {
+		t.Fatalf("Windows probe is not allowlisted and nonfatal: %s", windowsRuntimeEnvironmentCommand)
+	}
+}
+
+func TestParseWindowsRuntimeEnvironment(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("9", runtimeEnvironmentValueLimit+1)
+	for _, tt := range []struct {
+		name   string
+		output string
+		want   runtimeEnvironment
+	}{
+		{
+			name:   "template and runner",
+			output: "IMAGE_VERSION=20261021.1\r\nImageVersion=other\r\nRUNNERD_PREINSTALLED_RUNNER_VERSION \r\n2.337.0\r\n",
+			want:   runtimeEnvironment{TemplateVersion: "20261021.1", RunnerVersion: "2.337.0"},
+		},
+		{
+			name:   "quoted ImageVersion only",
+			output: "ImageVersion=\"20261021.1\"\r\nRUNNERD_PREINSTALLED_RUNNER_VERSION\r\n",
+			want:   runtimeEnvironment{TemplateVersion: "20261021.1"},
+		},
+		{
+			name:   "missing image.env",
+			output: "RUNNERD_PREINSTALLED_RUNNER_VERSION \r\n\r\n2.337.0\r\n",
+			want:   runtimeEnvironment{RunnerVersion: "2.337.0"},
+		},
+		{
+			name:   "lines without separator are not a runner version",
+			output: "IMAGE_VERSION=1\r\n2.337.0\r\n",
+			want:   runtimeEnvironment{TemplateVersion: "1"},
+		},
+		{
+			name:   "oversized values",
+			output: "IMAGE_VERSION=" + long + "\r\nRUNNERD_PREINSTALLED_RUNNER_VERSION\r\n" + long + "\r\n",
+			want:   runtimeEnvironment{},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseWindowsRuntimeEnvironment(tt.output); got != tt.want {
+				t.Fatalf("parseWindowsRuntimeEnvironment = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -274,16 +332,6 @@ func TestRunnerApplicationsManifestFiltersByPlatform(t *testing.T) {
 	}
 	if got := runnerApplicationsManifest("", applications); got != linux {
 		t.Fatalf("unspecified platform manifest = %q, want Linux manifest", got)
-	}
-}
-
-func TestWindowsRuntimeEnvironmentCommandAvoidsCmdMetacharacters(t *testing.T) {
-	t.Parallel()
-	// cmd.exe expands %VAR% even inside quotes, and an embedded quote would end
-	// the -Command argument early.
-	body := strings.TrimSuffix(strings.SplitN(windowsRuntimeEnvironmentCommand, `-Command "`, 2)[1], `"`)
-	if strings.ContainsAny(body, `%"`) {
-		t.Fatalf("Windows runtime environment command contains cmd metacharacters: %s", body)
 	}
 }
 

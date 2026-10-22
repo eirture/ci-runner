@@ -279,18 +279,17 @@ const windowsRunnerBootstrapUser = qnsandbox.DefaultUser
 const (
 	windowsStartRunnerScriptPath = `C:\ProgramData\qiniu-runner\start-github-runner.ps1`
 	// Windows envd runs commands through cmd.exe.
-	windowsStartRunnerCommand        = `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ` + windowsStartRunnerScriptPath
-	windowsRuntimeEnvironmentCommand = `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "` +
-		`$ErrorActionPreference='SilentlyContinue';` +
-		`$t=$env:IMAGE_VERSION;` +
-		`$f='C:\ProgramData\qiniu-runner\image.env';` +
-		`if(-not $t -and (Test-Path -LiteralPath $f)){foreach($l in Get-Content -LiteralPath $f){if($l -match '^(IMAGE_VERSION|ImageVersion)=(.*)$'){$t=$Matches[2].Trim().Trim([char]34).Trim([char]39);break}}};` +
-		`$r='';` +
-		`$x='C:\actions-runner\bin\Runner.Listener.exe';if(Test-Path -LiteralPath $x){$r=((& $x --version) | Out-String).Trim()};` +
-		`if($t.Length -gt 256){$t=''};if($r.Length -gt 256){$r=''};` +
-		`$e=[Text.Encoding]::UTF8;` +
-		`'template_version='+[Convert]::ToBase64String($e.GetBytes([string]$t));` +
-		`'runner_version='+[Convert]::ToBase64String($e.GetBytes([string]$r))"`
+	windowsStartRunnerCommand = `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ` + windowsStartRunnerScriptPath
+	// The runtime probe runs through cmd.exe only: PowerShell startup alone can
+	// exceed the five-second budget in a freshly created Sandbox. findstr prints
+	// only the allowlisted template-version lines, the separator splits them
+	// from the preinstalled Runner's --version output, and exit /b 0 keeps a
+	// missing file from discarding the values that were found.
+	windowsRuntimeEnvironmentCommand = `findstr /b /c:"IMAGE_VERSION=" /c:"ImageVersion=" C:\ProgramData\qiniu-runner\image.env 2>nul` +
+		` & echo ` + windowsRuntimeRunnerVersionSeparator +
+		` & if exist C:\actions-runner\bin\Runner.Listener.exe C:\actions-runner\bin\Runner.Listener.exe --version 2>nul` +
+		` & exit /b 0`
+	windowsRuntimeRunnerVersionSeparator = "RUNNERD_PREINSTALLED_RUNNER_VERSION"
 )
 
 func (p Platform) bootstrapUser() string {
@@ -807,9 +806,9 @@ func (c *effectiveRunnerVersionCapture) Version() string {
 }
 
 func readRuntimeEnvironment(ctx context.Context, sb *qnsandbox.Sandbox, platform Platform) runtimeEnvironment {
-	command := runtimeEnvironmentCommand
+	command, parse := runtimeEnvironmentCommand, parseRuntimeEnvironment
 	if platform == PlatformWindows {
-		command = windowsRuntimeEnvironmentCommand
+		command, parse = windowsRuntimeEnvironmentCommand, parseWindowsRuntimeEnvironment
 	}
 	result, err := sb.Commands().Run(
 		ctx,
@@ -820,7 +819,7 @@ func readRuntimeEnvironment(ctx context.Context, sb *qnsandbox.Sandbox, platform
 	if err != nil || result == nil || result.ExitCode != 0 {
 		return runtimeEnvironment{}
 	}
-	return parseRuntimeEnvironment(result.Stdout)
+	return parse(result.Stdout)
 }
 
 func (s *E2BService) RunNetworkDiagnostic(ctx context.Context, sandboxID string, target NetworkDiagnosticTarget) (NetworkDiagnosticResult, error) {
@@ -1059,6 +1058,47 @@ func parseRuntimeEnvironment(output string) runtimeEnvironment {
 		case "runner_version":
 			environment.RunnerVersion = decoded
 		}
+	}
+	return environment
+}
+
+// parseWindowsRuntimeEnvironment reads the plain cmd.exe probe output: the
+// first allowlisted image.env line before the separator, then the first
+// nonempty line after it. Values over the limit are dropped.
+func parseWindowsRuntimeEnvironment(output string) runtimeEnvironment {
+	var environment runtimeEnvironment
+	limited := func(value string) string {
+		if len(value) > runtimeEnvironmentValueLimit {
+			return ""
+		}
+		return value
+	}
+	afterSeparator := false
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == windowsRuntimeRunnerVersionSeparator {
+			afterSeparator = true
+			continue
+		}
+		if afterSeparator {
+			if line != "" {
+				environment.RunnerVersion = limited(line)
+				break
+			}
+			continue
+		}
+		if environment.TemplateVersion != "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || (key != "IMAGE_VERSION" && key != "ImageVersion") {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
+			value = value[1 : len(value)-1]
+		}
+		environment.TemplateVersion = limited(value)
 	}
 	return environment
 }
