@@ -309,8 +309,9 @@ func (s *Server) enqueueRunnerRequest(req state.RunnerRequest, payload []byte) (
 
 func (s *Server) enqueueRunnerRequestLocked(req state.RunnerRequest, payload []byte) (state.RunnerState, bool, error) {
 	if st, err := s.store.ReadState(req.ID); err == nil {
+		st, err = s.wakeWaitingWorkflowJob(req, st)
 		s.logger.Info("runner request already exists", "id", req.ID, "status", st.Status)
-		return st, false, nil
+		return st, false, err
 	}
 	created, st, err := s.store.CreateRequest(req, payload)
 	if err != nil {
@@ -359,11 +360,10 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 		s.logger.Error("read runner state", "id", id, "error", err)
 		return
 	}
-	if st.Status == state.StatusCompleted || st.Status == state.StatusStopping {
+	if st.Status != state.StatusQueued {
 		unlock()
-		_ = s.store.ReleaseLease(id, workerID)
-		s.logger.Info("runner start skipped because request is stopped", "id", id, "status", st.Status)
-		s.store.AppendLog(id, "control.log", []byte("runner start skipped because request is stopped\n"))
+		s.logger.Info("runner start skipped because request is not queued", "id", id, "status", st.Status)
+		s.store.AppendLog(id, "control.log", []byte("runner start skipped because request is not queued\n"))
 		return
 	}
 	s.admissionMu.Lock()
@@ -427,13 +427,12 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 	s.admissionMu.Unlock()
 	unlock()
 
-	shouldStart, err := s.ensureWorkflowJobStillQueued(ctx, req)
+	shouldStart, err := s.ensureWorkflowJobStillQueued(ctx, req, workerID)
 	if err != nil {
 		s.failStart(id, st, "github_job_status", err)
 		return
 	}
 	if !shouldStart {
-		_ = s.store.ReleaseLease(id, workerID)
 		return
 	}
 
@@ -636,43 +635,15 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 	<-exitCh
 }
 
-func (s *Server) ensureWorkflowJobStillQueued(ctx context.Context, req state.RunnerRequest) (bool, error) {
-	if req.JobID == 0 {
-		return true, nil
-	}
-	s.logger.Info("checking workflow job status before sandbox start", "id", req.ID, "job_id", req.JobID, "repository", req.RepositoryFullName)
-	s.store.AppendLog(req.ID, "control.log", []byte("checking workflow job status before sandbox start\n"))
-	job, err := s.gh.GetWorkflowJob(ctx, req.RepositoryFullName, req.JobID)
-	if err != nil {
-		return false, err
-	}
-	if job.Status == "queued" {
-		s.logger.Info("workflow job is still queued", "id", req.ID, "job_id", req.JobID, "repository", req.RepositoryFullName)
-		return true, nil
-	}
-	reason := strings.TrimSpace(job.Status)
-	if job.Conclusion != "" {
-		reason += "/" + job.Conclusion
-	}
-	if reason == "" {
-		reason = "not_queued"
-	}
-	s.completeWithoutSandbox(req.ID, job, "workflow job is "+reason)
-	return false, nil
-}
-
-func (s *Server) completeWithoutSandbox(id string, job github.WorkflowJob, reason string) {
-	unlock := s.lockRunner(id)
-	defer unlock()
-
+// completeWithoutSandbox is called with the request lock held, only for a terminal Job.
+func (s *Server) completeWithoutSandbox(id string, job github.WorkflowJob, reason string) error {
 	st, err := s.store.ReadState(id)
 	if err != nil {
-		s.logger.Error("read runner state for skip", "id", id, "error", err)
-		return
+		return fmt.Errorf("read runner state for skip: %w", err)
 	}
 	if st.Status == state.StatusCompleted || st.Status == state.StatusStopping || st.Status == state.StatusRunning {
 		s.logger.Info("runner skip ignored because state already advanced", "id", id, "status", st.Status, "reason", reason)
-		return
+		return nil
 	}
 	if shouldRecordAssignedJob(st, job) {
 		st.AssignedJobID = job.ID
@@ -686,9 +657,9 @@ func (s *Server) completeWithoutSandbox(id string, job github.WorkflowJob, reaso
 	st.FailureReason = ""
 	st.LeaseOwner = ""
 	st.LeaseExpiresAt = time.Time{}
+	st.NextRetryAt = time.Time{}
 	if err := s.store.WriteState(st); err != nil {
-		s.logger.Error("write skipped runner state", "id", id, "error", err)
-		return
+		return fmt.Errorf("write skipped runner state: %w", err)
 	}
 	s.logger.Info("runner skipped before sandbox start", "id", id, "job_id", job.ID, "job_status", job.Status, "job_conclusion", job.Conclusion, "reason", reason)
 	s.store.AppendLog(id, "control.log", []byte("runner skipped before sandbox start: "+reason+"\n"))
@@ -699,6 +670,7 @@ func (s *Server) completeWithoutSandbox(id string, job github.WorkflowJob, reaso
 		metrics.RecordWorkflowFailure(st.RepositoryFullName, workflowNameFor(job.WorkflowName), jobName, st.ProfileName, "workflow_job", conclusion)
 	}
 	s.refreshMetrics()
+	return nil
 }
 
 func (s *Server) markWorkflowJobInProgress(id string, job github.WorkflowJob) (state.RunnerState, bool, error) {
@@ -1182,7 +1154,7 @@ func (s *Server) recoverActiveRunner(ctx context.Context, st state.RunnerState, 
 		}
 		if st.Status == state.StatusCreating {
 			switch {
-			case errors.Is(err, sandboxrunner.ErrSandboxNotFound) && (!hasJob || strings.EqualFold(strings.TrimSpace(job.Status), "queued")):
+			case errors.Is(err, sandboxrunner.ErrSandboxNotFound) && (!hasJob || job.Status == "queued" || isWorkflowJobWaiting(job.Status)):
 				return s.requeueInterruptedCreation(st.ID, stateVersion)
 			case errors.Is(err, sandboxrunner.ErrSandboxNotFound) && strings.EqualFold(strings.TrimSpace(job.Status), "in_progress"):
 				s.failAndStopRunnerVersion(ctx, st.ID, stateVersion, "recovery", "sandbox_not_found", "runner sandbox no longer exists after interrupted creation")
