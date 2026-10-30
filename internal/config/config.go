@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,6 +53,9 @@ type Config struct {
 	DeploymentWorkRoot        string
 	DeploymentMaxConcurrent   int
 	DeploymentRetention       time.Duration
+
+	RunnerAccountConcurrency    map[string]int
+	RunnerRepositoryConcurrency map[string]int
 }
 
 type SandboxRegionConfig struct {
@@ -115,6 +120,9 @@ type fileConfig struct {
 		RetryBaseDelaySec    int `yaml:"retry_base_delay_seconds"`
 		RetryMaxDelaySec     int `yaml:"retry_max_delay_seconds"`
 		RetryMaxAttempts     int `yaml:"retry_max_attempts"`
+
+		AccountConcurrencyLimits    map[string]int `yaml:"account_concurrency_limits"`
+		RepositoryConcurrencyLimits map[string]int `yaml:"repository_concurrency_limits"`
 	} `yaml:"worker"`
 	Cache struct {
 		STSEndpoint string `yaml:"sts_endpoint"`
@@ -177,6 +185,14 @@ func LoadFile(path string) (Config, error) {
 	if strings.TrimSpace(raw.GitHub.Owner) != "" || strings.TrimSpace(raw.GitHub.Repo) != "" {
 		return Config{}, fmt.Errorf("invalid config github.owner/github.repo: no longer supported; pass repository_full_name on manual runner requests")
 	}
+	accountLimits, err := normalizeRunnerConcurrencyLimits(raw.Worker.AccountConcurrencyLimits, false)
+	if err != nil {
+		return Config{}, err
+	}
+	repositoryLimits, err := normalizeRunnerConcurrencyLimits(raw.Worker.RepositoryConcurrencyLimits, true)
+	if err != nil {
+		return Config{}, err
+	}
 	configDir := filepath.Dir(path)
 	cfg := Config{
 		HTTPAddr:                  defaultString(raw.Server.HTTPAddr, ":25500"),
@@ -218,6 +234,9 @@ func LoadFile(path string) (Config, error) {
 		DeploymentWorkRoot:        strings.TrimSpace(raw.Deploy.WorkRoot),
 		DeploymentMaxConcurrent:   defaultInt(raw.Deploy.MaxConcurrentPerScope, 3),
 		DeploymentRetention:       durationHours(raw.Deploy.RetentionHours, 168),
+
+		RunnerAccountConcurrency:    accountLimits,
+		RunnerRepositoryConcurrency: repositoryLimits,
 	}
 	if cfg.StateBackend == "sqlite" {
 		if strings.TrimSpace(cfg.StateDatabaseDSN.Value()) == "" {
@@ -246,6 +265,51 @@ func LoadFile(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// Limits use GitHub repository ownership, independently of the triggering user,
+// credential scope, App installation or selected Runner Spec.
+func normalizeRunnerConcurrencyLimits(raw map[string]int, repository bool) (map[string]int, error) {
+	field := "worker.account_concurrency_limits"
+	expected := "GitHub owner login"
+	if repository {
+		field = "worker.repository_concurrency_limits"
+		expected = "owner/repository"
+	}
+	limits := make(map[string]int, len(raw))
+	originalKeys := make(map[string]string, len(raw))
+	for _, rawKey := range slices.Sorted(maps.Keys(raw)) {
+		limit := raw[rawKey]
+		key := strings.ToLower(strings.TrimSpace(rawKey))
+		parts := strings.Split(key, "/")
+		wantParts := 1
+		if repository {
+			wantParts = 2
+		}
+		valid := len(parts) == wantParts
+		for i, part := range parts {
+			if part == "" || part == "." || part == ".." {
+				valid = false
+			}
+			for _, ch := range part {
+				if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_' || i == 1 && ch == '.') {
+					valid = false
+				}
+			}
+		}
+		if !valid {
+			return nil, fmt.Errorf("invalid config %s[%q]=%d: expected %s", field, rawKey, limit, expected)
+		}
+		if limit < 0 {
+			return nil, fmt.Errorf("invalid config %s[%q]=%d: concurrency limit must be nonnegative", field, rawKey, limit)
+		}
+		if _, exists := limits[key]; exists {
+			return nil, fmt.Errorf("invalid config %s[%q]=%d: duplicate normalized key %q (also configured as %q)", field, rawKey, limit, key, originalKeys[key])
+		}
+		limits[key] = limit
+		originalKeys[key] = rawKey
+	}
+	return limits, nil
 }
 
 func (c Config) GitHubAuthMode() string {
