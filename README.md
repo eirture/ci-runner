@@ -106,6 +106,8 @@ Jobs provide deployment history and a creation link pinned to the selected Job c
 | `github` | Webhook secret, auth method (App / PAT / basic), OAuth, allowed repositories |
 | `worker` | Lease, retry, and concurrency settings |
 
+Operators can set `worker.account_concurrency_limits` by GitHub repository owner and `worker.repository_concurrency_limits` by `owner/repo`. They aggregate across Runner Specs; omitted entries or `0` preserve existing behavior. Restart to apply changes; see [concurrency configuration](docs/testing.md#ci-runner-account-and-repository-concurrency).
+
 Key notes:
 
 - Relative `database.dsn` and `github.app.private_key_file` paths resolve from the config file's directory.
@@ -263,7 +265,7 @@ Runner specs are managed through the admin API and console — not through `runn
 - **GitHub Runner Group**: when a spec sets `runner_group`, runnerd creates an organization-level runner in that GitHub group; otherwise it creates a repository-level runner. This is not the retired internal Runner Group model. Organization forms explain repository-level registration, offer a live group selector, and generate `group` + `labels` YAML. New/changed groups and re-enablement are validated before saving; startup checks group and exact repository access before provisioning. Admin platform specs retain manual names for their multiple organization contexts. See [GitHub Runner groups](docs/platform-runner-specs.md#github-runner-groups).
 
 > **⚠️ Personal accounts:** `runner_group` requires the organization-level GitHub API. If the repository belongs to a personal account (not an organization), leave `runner_group` **empty** — otherwise the organization-group preflight will reject startup.
-- **Windows runners (preview)**: a spec whose labels include `windows` uses the Windows launch path: a PowerShell start script, the envd default user, Windows Runner downloads for fixed-ID preflight, and no Docker requirement. Bind it to a [`github-runner-windows-11`](templates/github-runner-windows-11/README.md) template ID, for example with labels `self-hosted,windows,x64,qiniu,windows-11`. Rebuilt templates include MSYS2 UCRT64 GCC (`gcc`, `g++`) for cgo on `PATH`, without LLVM. Network diagnostics and the Web Console do not support Windows Sandboxes yet.
+- **Windows runners (preview)**: a spec whose labels include `windows` uses the Windows launch path: a PowerShell start script, the envd default user, Windows Runner downloads for fixed-ID preflight, and no Docker requirement. Windows uses a fresh GitHub JIT configuration bound to one ephemeral Runner instead of a reusable registration token; runnerd retains API cleanup responsibility if provisioning fails. The bootstrap file is scrubbed before the Runner starts. This does not isolate workflow code from that Runner's own same-user credentials or process memory. Bind it to a [`github-runner-windows-11`](templates/github-runner-windows-11/README.md) template ID, for example with labels `self-hosted,windows,x64,qiniu,windows-11`. Rebuilt templates include MSYS2 UCRT64 GCC (`gcc`, `g++`) for cgo on `PATH`, without LLVM. Network diagnostics and the Web Console do not support Windows Sandboxes yet.
 
 Matching always enforces `required_labels ⊆ job_labels ⊆ labels`. Migrated Ubuntu specs preserve their `qiniu` and exact OS required labels; changing the catalog in Admin changes the workflow contract. Enablement and publication are separate controls.
 
