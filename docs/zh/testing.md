@@ -837,6 +837,14 @@ apt 管理的 `packaging` 保持不变、pipx 工具目录兼容、普通用户�
 
 ### Windows Runner 端到端测试
 
+`task template-build-windows-11` 在完整升级 MSYS2 后从当前稳定仓库安装 UCRT64 GCC，
+检查 x64 目标，并编译、运行 C 和 C++ 冒烟程序。安装器固定版本及校验值；
+滚动更新的包保留 pacman 签名验证，实际安装版本保存到
+`C:\ProgramData\qiniu-runner\msys2-packages.txt`。在真实 workflow 中验证
+UCRT64 PATH 解析，并在重建后重新测量磁盘剩余空间。
+本地 `go test ./internal/sandboxrunner -run TestWindowsTemplate -count=1`
+仅检查源码契约，不代表 Windows 执行通过。
+
 `internal/sandboxrunner` 中的 `TestWindowsRunnerE2E` 会在真实 Windows Sandbox 上依次执行
 `StartRunner`、`RecoverRunner`、一个真实 GitHub Actions job 和 `StopRunner`。只有设置
 `RUNNERD_WINDOWS_E2E=1` 时才会运行，需要 `QINIU_SANDBOX_API_URL`、`QINIU_API_KEY`、
