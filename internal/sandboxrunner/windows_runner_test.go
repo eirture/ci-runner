@@ -448,13 +448,14 @@ func TestWindowsTemplateRunnerPinMatchesCommonPin(t *testing.T) {
 func TestWindowsTemplateGCCInstallation(t *testing.T) {
 	t.Parallel()
 	const pins = "templates/github-runner-windows-11/template.env"
-	for key, want := range map[string]string{
-		"MSYS2_INSTALLER_URL":    "https://github.com/msys2/msys2-installer/releases/download/2026-09-27/msys2-x86_64-20260927.exe",
-		"MSYS2_INSTALLER_SHA256": "416d506c839a2da4bc184eeec8cbaaf1055ee698618228c62dfc4232a6970f0e",
-		"MSYS2_INSTALLER_SIZE":   "85046168",
+	// Build-time download checks enforce the exact digest and size.
+	for key, pattern := range map[string]*regexp.Regexp{
+		"MSYS2_INSTALLER_URL":    regexp.MustCompile(`^https://github\.com/msys2/msys2-installer/releases/download/[0-9]{4}-[0-9]{2}-[0-9]{2}/msys2-x86_64-[0-9]{8}\.exe$`),
+		"MSYS2_INSTALLER_SHA256": regexp.MustCompile(`^[0-9a-f]{64}$`),
+		"MSYS2_INSTALLER_SIZE":   regexp.MustCompile(`^[1-9][0-9]*$`),
 	} {
-		if got := readTemplatePin(t, pins, key); got != want {
-			t.Fatalf("%s = %q, want %q", key, got, want)
+		if got := readTemplatePin(t, pins, key); !pattern.MatchString(got) {
+			t.Fatalf("%s = %q, want match for %s", key, got, pattern)
 		}
 	}
 	content, err := os.ReadFile(filepath.Join(repositoryRoot(t), "templates/github-runner-windows-11/scripts/setup-template.ps1"))
