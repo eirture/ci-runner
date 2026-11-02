@@ -25,7 +25,7 @@ the stable rolling repository with pacman's signature verification. The script i
   `git`, `bash`, and `sh` resolve like they do on GitHub-hosted Windows images;
 - PowerShell 7 (`pwsh`), the default `run` shell on Windows runners;
 - MSYS2 in `C:\msys64`, fully upgraded before installing
-  `mingw-w64-ucrt-x86_64-gcc` for Windows amd64 cgo. Only `C:\msys64\ucrt64\bin`
+  `mingw-w64-ucrt-x86_64-gcc`, the x64 UCRT C/C++ toolchain. Only `C:\msys64\ucrt64\bin`
   is added to machine `PATH`, not MSYS2's `usr\bin`, preserving Git Bash and
   Windows tool resolution. This provides `gcc` and `g++`, without explicitly
   installing Fortran or LLVM. Setup records compiler versions, checks the x64
@@ -34,7 +34,7 @@ the stable rolling repository with pacman's signature verification. The script i
 Installed package versions are saved in
 `C:\ProgramData\qiniu-runner\msys2-packages.txt`. Rebuilds may select newer packages;
 retain the tested template version rather than expecting byte-identical rebuilds.
-Go remains workflow-managed; `CGO_ENABLED`, `CC`, and `CXX` are not forced machine-wide.
+`CC` and `CXX` are not set machine-wide; workflows choose their own compiler settings.
 
 It also creates `C:\runner\work` and `C:\hostedtoolcache`, sets
 `RUNNER_TOOL_CACHE`, `AGENT_TOOLSDIRECTORY`, `ImageOS=win11`, and
